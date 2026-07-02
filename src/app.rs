@@ -770,35 +770,22 @@ impl App {
         f.render_widget(log, log_area);
 
         if let Some(dialog) = &self.dialog {
-            fn centered_dialog_area(width: u16, lines: u16, viewport: Rect) -> Rect {
-                let dialog_width = min(width, viewport.width);
-                let dialog_height = min(lines, viewport.height);
-                let dialog_x = viewport.x + viewport.width.saturating_sub(dialog_width) / 2;
-                let dialog_y = viewport.y + viewport.height.saturating_sub(dialog_height) / 2;
-
-                Rect::new(dialog_x, dialog_y, dialog_width, dialog_height)
-            }
-
             match dialog {
                 Dialog::ConfirmCancelJob(id) => {
-                    let dialog = Paragraph::new(Line::from(vec![
+                    let content = Text::from(Line::from(vec![
                         Span::raw("Cancel job "),
                         Span::styled(id, Style::default().add_modifier(Modifier::BOLD)),
                         Span::raw("?"),
-                    ]))
-                    .style(Style::default().fg(Color::White))
-                    .wrap(Wrap { trim: true })
-                    .block(
-                        Block::default()
-                            .title("─Cancel")
-                            .borders(Borders::ALL)
-                            .border_type(BorderType::Rounded)
-                            .style(Style::default().fg(Color::Green)),
-                    );
+                    ]));
 
-                    let area = centered_dialog_area(DIALOG_WIDTH, 3, f.area());
-                    f.render_widget(Clear, area);
-                    f.render_widget(dialog, area);
+                    render_dialog(
+                        f,
+                        "Cancel",
+                        Color::Green,
+                        3,
+                        content,
+                        Some(Wrap { trim: true }),
+                    );
                 }
                 Dialog::SelectCancelSignal {
                     id,
@@ -824,35 +811,21 @@ impl App {
                             Span::styled(*signal, signal_style),
                         ])
                     }));
+                    let content = Text::from(rows);
 
-                    let dialog = Paragraph::new(Text::from(rows))
-                        .style(Style::default().fg(Color::White))
-                        .wrap(Wrap { trim: true })
-                        .block(
-                            Block::default()
-                                .title("─Signal")
-                                .borders(Borders::ALL)
-                                .border_type(BorderType::Rounded)
-                                .style(Style::default().fg(Color::Green)),
-                        );
-
-                    let area = centered_dialog_area(
-                        DIALOG_WIDTH,
+                    render_dialog(
+                        f,
+                        "Signal",
+                        Color::Green,
                         SCANCEL_SIGNALS.len() as u16 + 4,
-                        f.area(),
+                        content,
+                        Some(Wrap { trim: true }),
                     );
-                    f.render_widget(Clear, area);
-                    f.render_widget(dialog, area);
                 }
                 Dialog::EditTimeLimit { id, input } => {
-                    let block = Block::default()
-                        .title("─Time Limit")
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .style(Style::default().fg(Color::Green));
-
                     let area = centered_dialog_area(DIALOG_WIDTH, 3, f.area());
-                    let inner = block.inner(area);
+                    let inner = Block::default().borders(Borders::ALL).inner(area);
+
                     let prompt_prefix = "Set time limit for job ";
                     let prompt_suffix = ": ";
                     let prompt_width = (prompt_prefix.chars().count()
@@ -867,17 +840,14 @@ impl App {
                         .skip(scroll)
                         .take(available_width)
                         .collect::<String>();
-                    let dialog = Paragraph::new(Line::from(vec![
+                    let content = Text::from(Line::from(vec![
                         Span::raw(prompt_prefix),
                         Span::styled(id, Style::default().add_modifier(Modifier::BOLD)),
                         Span::raw(prompt_suffix),
                         Span::styled(visible_value, Style::default().fg(Color::Blue)),
-                    ]))
-                    .style(Style::default().fg(Color::White))
-                    .block(block);
+                    ]));
 
-                    f.render_widget(Clear, area);
-                    f.render_widget(dialog, area);
+                    let inner = render_dialog(f, "Time Limit", Color::Green, 3, content, None);
 
                     let cursor_offset = input.visual_cursor().saturating_sub(scroll) as u16;
                     let cursor_x = inner
@@ -895,24 +865,62 @@ impl App {
                         .count()
                         .saturating_add(2)
                         .min(u16::MAX as usize) as u16;
-                    let dialog = Paragraph::new(dialog_text)
-                        .style(Style::default().fg(Color::White))
-                        .wrap(Wrap { trim: false })
-                        .block(
-                            Block::default()
-                                .title("─Command Error")
-                                .borders(Borders::ALL)
-                                .border_type(BorderType::Rounded)
-                                .style(Style::default().fg(Color::Red)),
-                        );
+                    let content = Text::from(dialog_text);
 
-                    let area = centered_dialog_area(DIALOG_WIDTH, lines, f.area());
-                    f.render_widget(Clear, area);
-                    f.render_widget(dialog, area);
+                    render_dialog(
+                        f,
+                        "Command Error",
+                        Color::Red,
+                        lines,
+                        content,
+                        Some(Wrap { trim: false }),
+                    );
                 }
             }
         }
     }
+}
+
+fn centered_dialog_area(width: u16, lines: u16, viewport: Rect) -> Rect {
+    let dialog_width = min(width, viewport.width);
+    let dialog_height = min(lines, viewport.height);
+    let dialog_x = viewport.x + viewport.width.saturating_sub(dialog_width) / 2;
+    let dialog_y = viewport.y + viewport.height.saturating_sub(dialog_height) / 2;
+
+    Rect::new(dialog_x, dialog_y, dialog_width, dialog_height)
+}
+
+/// Renders a dialog box scaffold (bordered block, centered and cleared) with the given
+/// content, returning the block's inner `Rect` for callers that need to lay out further
+/// details (e.g. a text cursor) relative to it.
+fn render_dialog(
+    f: &mut Frame,
+    title: &str,
+    color: Color,
+    height: u16,
+    content: Text,
+    wrap: Option<Wrap>,
+) -> Rect {
+    let block = Block::default()
+        .title(format!("─{title}"))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .style(Style::default().fg(color));
+
+    let area = centered_dialog_area(DIALOG_WIDTH, height, f.area());
+    let inner = block.inner(area);
+
+    let mut paragraph = Paragraph::new(content)
+        .style(Style::default().fg(Color::White))
+        .block(block);
+    if let Some(wrap) = wrap {
+        paragraph = paragraph.wrap(wrap);
+    }
+
+    f.render_widget(Clear, area);
+    f.render_widget(paragraph, area);
+
+    inner
 }
 
 fn chunked_string(s: &str, first_chunk_size: usize, chunk_size: usize) -> Vec<&str> {
