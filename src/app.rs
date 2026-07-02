@@ -823,7 +823,7 @@ impl App {
                     );
                 }
                 Dialog::EditTimeLimit { id, input } => {
-                    let area = centered_dialog_area(DIALOG_WIDTH, 3, f.area());
+                    let area = dialog_area(3, f.area());
                     let inner = Block::default().borders(Borders::ALL).inner(area);
 
                     let prompt_prefix = "Set time limit for job ";
@@ -881,18 +881,15 @@ impl App {
     }
 }
 
-fn centered_dialog_area(width: u16, lines: u16, viewport: Rect) -> Rect {
-    let dialog_width = min(width, viewport.width);
-    let dialog_height = min(lines, viewport.height);
+fn dialog_area(height: u16, viewport: Rect) -> Rect {
+    let dialog_width = min(DIALOG_WIDTH, viewport.width);
+    let dialog_height = min(height, viewport.height);
     let dialog_x = viewport.x + viewport.width.saturating_sub(dialog_width) / 2;
     let dialog_y = viewport.y + viewport.height.saturating_sub(dialog_height) / 2;
 
     Rect::new(dialog_x, dialog_y, dialog_width, dialog_height)
 }
 
-/// Renders a dialog box scaffold (bordered block, centered and cleared) with the given
-/// content, returning the block's inner `Rect` for callers that need to lay out further
-/// details (e.g. a text cursor) relative to it.
 fn render_dialog(
     f: &mut Frame,
     title: &str,
@@ -907,7 +904,7 @@ fn render_dialog(
         .border_type(BorderType::Rounded)
         .style(Style::default().fg(color));
 
-    let area = centered_dialog_area(DIALOG_WIDTH, height, f.area());
+    let area = dialog_area(height, f.area());
     let inner = block.inner(area);
 
     let mut paragraph = Paragraph::new(content)
