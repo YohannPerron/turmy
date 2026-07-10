@@ -1652,6 +1652,8 @@ dependencies = [
  "ratatui",
  "regex",
  "tui-input",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

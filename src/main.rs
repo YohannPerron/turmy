@@ -2,6 +2,7 @@ mod app;
 mod file_watcher;
 mod job_watcher;
 mod squeue_args;
+mod viewport;
 
 use app::App;
 use clap::CommandFactory;
