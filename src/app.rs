@@ -1,12 +1,15 @@
 use crossbeam_channel::{Receiver, TryRecvError, select, unbounded};
-use itertools::Either;
-use std::{cmp::min, iter::once, path::PathBuf, process::Command, time::Duration};
+use std::{cmp::min, io::Write, path::PathBuf, process::Command, time::Duration};
 
 use crate::file_watcher::{FileWatcherError, FileWatcherHandle};
 use crate::job_watcher::JobWatcherHandle;
-use crate::viewport::{Pane, PaneViewport, clip_line, display_width, wrap_line};
+use crate::viewport::{Pane, PaneViewport, clip_line, display_width};
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm::{
+    clipboard::CopyToClipboard,
+    event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind},
+    execute,
+};
 use ratatui::{
     Frame, Terminal,
     backend::Backend,
@@ -20,6 +23,7 @@ use ratatui::{
 };
 use std::io;
 use tui_input::{Input, backend::crossterm::EventHandler};
+use unicode_segmentation::UnicodeSegmentation;
 
 pub enum Dialog {
     ConfirmCancelJob(String),
@@ -39,11 +43,64 @@ pub enum ScrollAnchor {
     Bottom,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum OutputFileView {
     #[default]
     Stdout,
     Stderr,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct OutputPoint {
+    line: usize,
+    byte: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OutputCell {
+    start: OutputPoint,
+    end: OutputPoint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OutputSelection {
+    start: OutputPoint,
+    end: OutputPoint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RenderedOutputLine {
+    source_line: usize,
+    start_byte: usize,
+    end_byte: usize,
+    continuation: bool,
+}
+
+#[derive(Clone, Copy)]
+struct OutputRenderOptions {
+    height: usize,
+    width: usize,
+    anchor: ScrollAnchor,
+    offset: usize,
+    horizontal_offset: usize,
+    wrap: bool,
+    selection: Option<OutputSelection>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CopyKind {
+    Selection,
+    FullOutput,
+}
+
+struct PendingCopy {
+    content: String,
+    kind: CopyKind,
+}
+
+struct CopyFeedback {
+    message: String,
+    error: bool,
 }
 
 pub struct App {
@@ -68,6 +125,13 @@ pub struct App {
     output_viewport: PaneViewport,
     job_output_content_width: usize,
     pending_input_event: Option<Event>,
+    output_inner_area: Rect,
+    rendered_output_lines: Vec<RenderedOutputLine>,
+    output_selection: Option<OutputSelection>,
+    selection_anchor: Option<OutputCell>,
+    selection_dragged: bool,
+    pending_copy: Option<PendingCopy>,
+    copy_feedback: Option<CopyFeedback>,
 }
 
 pub struct Job {
@@ -105,6 +169,18 @@ pub enum AppMessage {
     Key(KeyEvent),
     MouseFocus(Pane),
     MouseClick(usize),
+    MouseSelectionStart {
+        column: u16,
+        row: u16,
+    },
+    MouseSelectionUpdate {
+        column: u16,
+        row: u16,
+    },
+    MouseSelectionEnd {
+        column: u16,
+        row: u16,
+    },
     MouseWheel {
         target: Pane,
         direction: MouseWheelDirection,
@@ -160,33 +236,46 @@ impl App {
             output_viewport: PaneViewport::default(),
             job_output_content_width: 0,
             pending_input_event: None,
+            output_inner_area: Rect::default(),
+            rendered_output_lines: Vec::new(),
+            output_selection: None,
+            selection_anchor: None,
+            selection_dragged: false,
+            pending_copy: None,
+            copy_feedback: None,
         }
     }
 }
 
 impl App {
-    pub fn run<B: Backend<Error = io::Error>>(
+    pub fn run<B: Backend<Error = io::Error> + Write>(
         &mut self,
         terminal: &mut Terminal<B>,
     ) -> io::Result<()> {
         terminal.draw(|f| self.ui(f))?;
 
         loop {
-            let (should_quit, should_draw) = if let Some(event) = self.pending_input_event.take() {
-                self.handle_input_event(event)
-            } else {
-                select! {
-                    recv(self.receiver) -> event => {
-                        self.handle(event.unwrap());
-                        (false, true)
+            let (should_quit, mut should_draw) =
+                if let Some(event) = self.pending_input_event.take() {
+                    self.handle_input_event(event)
+                } else {
+                    select! {
+                        recv(self.receiver) -> event => {
+                            self.handle(event.unwrap());
+                            (false, true)
+                        }
+                        recv(self.input_receiver) -> input_res => {
+                            self.handle_input_event(input_res.unwrap().unwrap())
+                        }
                     }
-                    recv(self.input_receiver) -> input_res => {
-                        self.handle_input_event(input_res.unwrap().unwrap())
-                    }
-                }
-            };
+                };
             if should_quit {
                 return Ok(());
+            }
+
+            if self.pending_copy.is_some() {
+                self.flush_pending_copy(terminal.backend_mut());
+                should_draw = true;
             }
 
             if should_draw {
@@ -237,8 +326,39 @@ impl App {
                             self.handle(AppMessage::MouseClick(index));
                             changed = true;
                         }
+                        if pane == Pane::Output
+                            && rect_contains(self.output_inner_area, mouse.column, mouse.row)
+                        {
+                            self.handle(AppMessage::MouseSelectionStart {
+                                column: mouse.column,
+                                row: mouse.row,
+                            });
+                            changed = true;
+                        }
                     }
                     (false, changed)
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if self.dialog.is_none() && self.selection_anchor.is_some() {
+                        self.handle(AppMessage::MouseSelectionUpdate {
+                            column: mouse.column,
+                            row: mouse.row,
+                        });
+                        (false, true)
+                    } else {
+                        (false, false)
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    if self.dialog.is_none() && self.selection_anchor.is_some() {
+                        self.handle(AppMessage::MouseSelectionEnd {
+                            column: mouse.column,
+                            row: mouse.row,
+                        });
+                        (false, true)
+                    } else {
+                        (false, false)
+                    }
                 }
                 MouseEventKind::ScrollUp
                 | MouseEventKind::ScrollDown
@@ -299,6 +419,7 @@ impl App {
                 // On refresh: keep the same job selected if it still exists
                 let old_index = self.job_list_state.selected();
                 let old_id = old_index.and_then(|i| self.jobs.get(i)).map(|j| j.id());
+                let previous_id = old_id.clone();
 
                 self.jobs = jobs;
 
@@ -313,6 +434,9 @@ impl App {
                     self.job_list_state.select(Some(new_index));
                 } else {
                     self.job_list_state.select_first();
+                }
+                if previous_id != self.selected_job_id() {
+                    self.clear_output_selection();
                 }
             }
             AppMessage::JobOutput(content) => {
@@ -405,6 +529,13 @@ impl App {
                     }
                 } else {
                     match key.code {
+                        KeyCode::Char('c' | 'C')
+                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            self.copy_selected_output()
+                        }
+                        KeyCode::Char('y') => self.copy_selected_output(),
+                        KeyCode::Char('Y') => self.copy_full_output(),
                         KeyCode::Tab => self.focus_next_panel(),
                         KeyCode::BackTab => self.focus_previous_panel(),
                         KeyCode::Char('h') | KeyCode::Left => {
@@ -474,7 +605,7 @@ impl App {
                                 }
                             };
                             match self.focus {
-                                Pane::Jobs => self.job_list_state.scroll_down_by(delta),
+                                Pane::Jobs => self.scroll_jobs_down_by(delta),
                                 Pane::Details => {}
                                 Pane::Output => self.scroll_job_output_down_by(delta),
                             }
@@ -492,7 +623,7 @@ impl App {
                                 }
                             };
                             match self.focus {
-                                Pane::Jobs => self.job_list_state.scroll_up_by(delta),
+                                Pane::Jobs => self.scroll_jobs_up_by(delta),
                                 Pane::Details => {}
                                 Pane::Output => self.scroll_job_output_up_by(delta),
                             }
@@ -517,7 +648,7 @@ impl App {
                                 self.job_output_anchor = ScrollAnchor::Bottom;
                             }
                         },
-                        KeyCode::Char('c') => {
+                        KeyCode::Char('c') if key.modifiers.is_empty() => {
                             if let Some(id) = self.selected_job_id() {
                                 self.dialog = Some(Dialog::ConfirmCancelJob(id));
                             }
@@ -539,6 +670,7 @@ impl App {
                             }
                         }
                         KeyCode::Char('o') => {
+                            self.clear_output_selection();
                             self.output_file_view = match self.output_file_view {
                                 OutputFileView::Stdout => OutputFileView::Stderr,
                                 OutputFileView::Stderr => OutputFileView::Stdout,
@@ -546,6 +678,7 @@ impl App {
                             self.output_viewport.reset_horizontal();
                         }
                         KeyCode::Char('w') => {
+                            self.clear_output_selection();
                             self.job_output_wrap = !self.job_output_wrap;
                             if self.job_output_wrap {
                                 self.output_viewport.reset_horizontal();
@@ -561,9 +694,32 @@ impl App {
                 }
             }
             AppMessage::MouseClick(index) => {
-                if self.dialog.is_none() && index < self.jobs.len() {
+                if self.dialog.is_none()
+                    && index < self.jobs.len()
+                    && self.job_list_state.selected() != Some(index)
+                {
+                    self.clear_output_selection();
                     self.job_list_state.select(Some(index));
                 }
+            }
+            AppMessage::MouseSelectionStart { column, row } => {
+                self.output_selection = None;
+                self.copy_feedback = None;
+                self.selection_anchor = self.output_cell_at(column, row);
+                self.selection_dragged = false;
+            }
+            AppMessage::MouseSelectionUpdate { column, row } => {
+                self.selection_dragged = true;
+                self.update_output_selection(column, row);
+            }
+            AppMessage::MouseSelectionEnd { column, row } => {
+                if self.selection_dragged {
+                    self.update_output_selection(column, row);
+                } else {
+                    self.output_selection = None;
+                }
+                self.selection_anchor = None;
+                self.selection_dragged = false;
             }
             AppMessage::MouseWheel {
                 target,
@@ -573,8 +729,8 @@ impl App {
                 if self.dialog.is_none() {
                     match target {
                         Pane::Jobs => match direction {
-                            MouseWheelDirection::Up => self.job_list_state.scroll_up_by(amount),
-                            MouseWheelDirection::Down => self.job_list_state.scroll_down_by(amount),
+                            MouseWheelDirection::Up => self.scroll_jobs_up_by(amount),
+                            MouseWheelDirection::Down => self.scroll_jobs_down_by(amount),
                             MouseWheelDirection::Left => {
                                 self.jobs_viewport.scroll_left_by(amount as usize);
                             }
@@ -649,6 +805,8 @@ impl App {
             ("esc", "cancel"),
             ("enter", "confirm"),
             ("c/C", "cancel/signal"),
+            ("ctrl+c/y", "copy selection"),
+            ("Y", "copy all output"),
             ("t", "set time limit"),
             ("o", "toggle stdout/stderr"),
             ("w", "toggle text wrap"),
@@ -904,6 +1062,16 @@ impl App {
                 Style::default().add_modifier(Modifier::DIM),
             ));
         }
+        if let Some(feedback) = &self.copy_feedback {
+            log_title_spans.push(Span::styled(
+                format!("[{}]", feedback.message),
+                Style::default().fg(if feedback.error {
+                    Color::Red
+                } else {
+                    Color::Green
+                }),
+            ));
+        }
         let log_title = Line::from(log_title_spans);
         let log_block = Block::default()
             .title(log_title)
@@ -915,6 +1083,7 @@ impl App {
                 self.dialog.is_some(),
             ));
         let log_inner = log_block.inner(log_area);
+        self.output_inner_area = log_inner;
         self.job_output_height = log_inner.height;
 
         // let job_log = self.job_stdout.as_deref().map(|s| {
@@ -929,21 +1098,31 @@ impl App {
         //     "".to_string()
         // });
 
-        let log = match self.job_output.as_deref() {
-            Ok(s) => Paragraph::new(fit_text(
-                s,
-                log_inner.height as usize,
-                log_inner.width as usize,
-                self.job_output_anchor,
-                self.job_output_offset as usize,
-                output_viewport.horizontal_offset(),
-                self.job_output_wrap,
-            )),
-            Err(e) => Paragraph::new(e.to_string())
+        let (log_text, rendered_output_lines, log_error) = match self.job_output.as_deref() {
+            Ok(s) => {
+                let (text, lines) = render_output_text(
+                    s,
+                    OutputRenderOptions {
+                        height: log_inner.height as usize,
+                        width: log_inner.width as usize,
+                        anchor: self.job_output_anchor,
+                        offset: self.job_output_offset as usize,
+                        horizontal_offset: output_viewport.horizontal_offset(),
+                        wrap: self.job_output_wrap,
+                        selection: self.output_selection,
+                    },
+                );
+                (text, lines, false)
+            }
+            Err(e) => (Text::from(e.to_string()), Vec::new(), true),
+        };
+        self.rendered_output_lines = rendered_output_lines;
+        let mut log = Paragraph::new(log_text).block(log_block);
+        if log_error {
+            log = log
                 .style(Style::default().fg(Color::Red))
-                .wrap(Wrap { trim: true }),
+                .wrap(Wrap { trim: true });
         }
-        .block(log_block);
 
         f.render_widget(log, log_area);
         render_horizontal_scrollbar(
@@ -1150,66 +1329,385 @@ fn render_dialog(
     inner
 }
 
-fn fit_text(
-    s: &'_ str,
-    lines: usize,
-    cols: usize,
+fn render_output_text(
+    output: &str,
+    options: OutputRenderOptions,
+) -> (Text<'static>, Vec<RenderedOutputLine>) {
+    let source_lines = completed_output_lines(output);
+    let rendered_lines = visible_output_lines(
+        &source_lines,
+        options.height,
+        options.width,
+        options.anchor,
+        options.offset,
+        options.wrap,
+    );
+    let text = Text::from(
+        rendered_lines
+            .iter()
+            .map(|rendered| {
+                render_output_line(
+                    source_lines[rendered.source_line],
+                    *rendered,
+                    options.width,
+                    options.horizontal_offset,
+                    options.wrap,
+                    options.selection,
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+    (text, rendered_lines)
+}
+
+fn completed_output_lines(output: &str) -> Vec<&str> {
+    let completed = output
+        .rsplit_once(['\r', '\n'])
+        .map_or(output, |(completed, _)| completed);
+    completed
+        .lines()
+        .flat_map(|line| line.split('\r'))
+        .collect()
+}
+
+fn visible_output_lines(
+    source_lines: &[&str],
+    height: usize,
+    width: usize,
     anchor: ScrollAnchor,
     offset: usize,
+    wrap: bool,
+) -> Vec<RenderedOutputLine> {
+    let mut rendered = Vec::new();
+    let source_indices: Box<dyn Iterator<Item = usize>> = match anchor {
+        ScrollAnchor::Top => Box::new(offset..source_lines.len()),
+        ScrollAnchor::Bottom => Box::new((0..source_lines.len()).rev().skip(offset)),
+    };
+
+    for source_line in source_indices {
+        let mut ranges = if wrap {
+            wrap_byte_ranges(source_lines[source_line], width, width.saturating_sub(2))
+        } else {
+            vec![(0, source_lines[source_line].len())]
+        };
+        if matches!(anchor, ScrollAnchor::Bottom) {
+            ranges.reverse();
+        }
+
+        let range_count = ranges.len();
+        for (range_index, (start_byte, end_byte)) in ranges.into_iter().enumerate() {
+            let continuation = if matches!(anchor, ScrollAnchor::Top) {
+                range_index > 0
+            } else {
+                range_index + 1 < range_count
+            };
+            rendered.push(RenderedOutputLine {
+                source_line,
+                start_byte,
+                end_byte,
+                continuation,
+            });
+            if rendered.len() >= height {
+                break;
+            }
+        }
+        if rendered.len() >= height {
+            break;
+        }
+    }
+
+    if matches!(anchor, ScrollAnchor::Bottom) {
+        rendered.reverse();
+    }
+    rendered
+}
+
+fn wrap_byte_ranges(
+    text: &str,
+    first_width: usize,
+    continuation_width: usize,
+) -> Vec<(usize, usize)> {
+    if text.is_empty() {
+        return vec![(0, 0)];
+    }
+    if first_width == 0 && continuation_width == 0 {
+        return vec![(0, text.len())];
+    }
+
+    let mut ranges = Vec::new();
+    let mut start_byte = 0usize;
+    let mut current_width = 0usize;
+    let mut available_width = if first_width == 0 {
+        continuation_width
+    } else {
+        first_width
+    };
+
+    for (byte, grapheme) in text.grapheme_indices(true) {
+        let grapheme_width = display_width(grapheme);
+        if available_width > 0
+            && byte > start_byte
+            && current_width.saturating_add(grapheme_width) > available_width
+        {
+            ranges.push((start_byte, byte));
+            start_byte = byte;
+            current_width = 0;
+            available_width = continuation_width;
+        }
+
+        current_width = current_width.saturating_add(grapheme_width);
+        let grapheme_end = byte + grapheme.len();
+        if available_width > 0 && current_width >= available_width {
+            ranges.push((start_byte, grapheme_end));
+            start_byte = grapheme_end;
+            current_width = 0;
+            available_width = continuation_width;
+        }
+    }
+
+    if start_byte < text.len() {
+        ranges.push((start_byte, text.len()));
+    }
+    ranges
+}
+
+fn render_output_line(
+    source: &str,
+    rendered: RenderedOutputLine,
+    width: usize,
     horizontal_offset: usize,
     wrap: bool,
-) -> Text<'_> {
-    let s = s.rsplit_once(['\r', '\n']).map_or(s, |(p, _)| p); // skip everything after last line delimiter
-    let l = s.lines().flat_map(|l| l.split('\r')); // bandaid for term escape codes
-    let iter = match anchor {
-        ScrollAnchor::Top => Either::Left(l),
-        ScrollAnchor::Bottom => Either::Right(l.rev()),
-    };
-    let iter = iter
-        .skip(offset)
-        .flat_map(|l| {
-            let iter = if wrap {
-                Either::Left(
-                    wrap_line(l, cols, cols.saturating_sub(2))
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, l)| {
-                            if i == 0 {
-                                Line::raw(l)
-                            } else {
-                                Line::default().spans(vec![
-                                    Span::styled(
-                                        "↪ ",
-                                        Style::default().add_modifier(Modifier::DIM),
-                                    ),
-                                    Span::raw(l),
-                                ])
-                            }
-                        }),
-                )
-            } else {
-                let line = Line::raw(l);
-                Either::Right(once(clip_line(&line, horizontal_offset, cols)))
-            };
-            match anchor {
-                ScrollAnchor::Top => Either::Left(iter),
-                ScrollAnchor::Bottom => Either::Right(iter.rev()),
-            }
-        })
-        .take(lines);
+    selection: Option<OutputSelection>,
+) -> Line<'static> {
+    let selection_style = Style::default().fg(Color::Black).bg(Color::LightBlue);
+    let mut spans = Vec::new();
+    if wrap && rendered.continuation {
+        spans.push(Span::styled(
+            "↪ ",
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+    }
 
-    match anchor {
-        ScrollAnchor::Top => Text::from(iter.collect::<Vec<_>>()),
-        ScrollAnchor::Bottom => Text::from(
-            iter.collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>(),
-        ),
+    let source_slice = if wrap {
+        &source[rendered.start_byte..rendered.end_byte]
+    } else {
+        source
+    };
+    let base_byte = if wrap { rendered.start_byte } else { 0 };
+    for (relative_byte, grapheme) in source_slice.grapheme_indices(true) {
+        let start = OutputPoint {
+            line: rendered.source_line,
+            byte: base_byte + relative_byte,
+        };
+        let end = OutputPoint {
+            line: rendered.source_line,
+            byte: start.byte + grapheme.len(),
+        };
+        let selected =
+            selection.is_some_and(|selection| start < selection.end && end > selection.start);
+        spans.push(Span::styled(
+            grapheme.to_string(),
+            if selected {
+                selection_style
+            } else {
+                Style::default()
+            },
+        ));
+    }
+
+    let line = Line::from(spans);
+    if wrap {
+        line
+    } else {
+        clip_line(&line, horizontal_offset, width)
     }
 }
 
+fn selected_output_text(output: &str, selection: OutputSelection) -> Option<String> {
+    if selection.start >= selection.end {
+        return None;
+    }
+    let lines = completed_output_lines(output);
+    let first = *lines.get(selection.start.line)?;
+    let last = *lines.get(selection.end.line)?;
+    if selection.start.byte > first.len()
+        || selection.end.byte > last.len()
+        || !first.is_char_boundary(selection.start.byte)
+        || !last.is_char_boundary(selection.end.byte)
+    {
+        return None;
+    }
+
+    let mut selected = String::new();
+    for (line_index, line) in lines
+        .iter()
+        .enumerate()
+        .take(selection.end.line + 1)
+        .skip(selection.start.line)
+    {
+        if line_index > selection.start.line {
+            selected.push('\n');
+        }
+        let start = if line_index == selection.start.line {
+            selection.start.byte
+        } else {
+            0
+        };
+        let end = if line_index == selection.end.line {
+            selection.end.byte
+        } else {
+            line.len()
+        };
+        selected.push_str(&line[start..end]);
+    }
+    Some(selected)
+}
+
 impl App {
+    fn clear_output_selection(&mut self) {
+        self.output_selection = None;
+        self.selection_anchor = None;
+        self.selection_dragged = false;
+        self.copy_feedback = None;
+    }
+
+    fn output_cell_at(&self, column: u16, row: u16) -> Option<OutputCell> {
+        let area = self.output_inner_area;
+        if area.width == 0 || area.height == 0 || self.rendered_output_lines.is_empty() {
+            return None;
+        }
+        let column = column.clamp(area.x, area.x.saturating_add(area.width - 1));
+        let row = row.clamp(area.y, area.y.saturating_add(area.height - 1));
+        let rendered = *self.rendered_output_lines.get((row - area.y) as usize)?;
+        let output = self.job_output.as_ref().ok()?;
+        let source_lines = completed_output_lines(output);
+        let source = *source_lines.get(rendered.source_line)?;
+        let screen_column = (column - area.x) as usize;
+
+        let (start_byte, end_byte, display_column) = if self.job_output_wrap {
+            let prefix_width = usize::from(rendered.continuation) * 2;
+            if screen_column < prefix_width {
+                return Some(OutputCell {
+                    start: OutputPoint {
+                        line: rendered.source_line,
+                        byte: rendered.start_byte,
+                    },
+                    end: OutputPoint {
+                        line: rendered.source_line,
+                        byte: rendered.start_byte,
+                    },
+                });
+            }
+            (
+                rendered.start_byte,
+                rendered.end_byte,
+                screen_column - prefix_width,
+            )
+        } else {
+            (
+                0,
+                source.len(),
+                screen_column + self.output_viewport.horizontal_offset(),
+            )
+        };
+
+        let (start_byte, end_byte) =
+            grapheme_cell_at_display_column(source, start_byte, end_byte, display_column);
+        Some(OutputCell {
+            start: OutputPoint {
+                line: rendered.source_line,
+                byte: start_byte,
+            },
+            end: OutputPoint {
+                line: rendered.source_line,
+                byte: end_byte,
+            },
+        })
+    }
+
+    fn update_output_selection(&mut self, column: u16, row: u16) {
+        let (Some(anchor), Some(active)) =
+            (self.selection_anchor, self.output_cell_at(column, row))
+        else {
+            return;
+        };
+        let (start, end) = if active.start < anchor.start {
+            (active.start, anchor.end)
+        } else {
+            (anchor.start, active.end)
+        };
+        self.output_selection = (start < end).then_some(OutputSelection { start, end });
+    }
+
+    fn copy_selected_output(&mut self) {
+        let content = self.output_selection.and_then(|selection| {
+            self.job_output
+                .as_ref()
+                .ok()
+                .and_then(|output| selected_output_text(output, selection))
+        });
+        match content {
+            Some(content) if !content.is_empty() => {
+                self.pending_copy = Some(PendingCopy {
+                    content,
+                    kind: CopyKind::Selection,
+                });
+            }
+            _ => {
+                self.pending_copy = None;
+                self.copy_feedback = Some(CopyFeedback {
+                    message: "Nothing selected".to_string(),
+                    error: true,
+                });
+            }
+        }
+    }
+
+    fn copy_full_output(&mut self) {
+        let content = self
+            .job_output
+            .as_ref()
+            .ok()
+            .filter(|output| !output.is_empty());
+        match content {
+            Some(content) => {
+                self.pending_copy = Some(PendingCopy {
+                    content: content.clone(),
+                    kind: CopyKind::FullOutput,
+                });
+            }
+            None => {
+                self.pending_copy = None;
+                self.copy_feedback = Some(CopyFeedback {
+                    message: "No output to copy".to_string(),
+                    error: true,
+                });
+            }
+        }
+    }
+
+    fn flush_pending_copy(&mut self, writer: &mut impl Write) {
+        let Some(copy) = self.pending_copy.take() else {
+            return;
+        };
+        let length = copy.content.chars().count();
+        self.copy_feedback = Some(
+            match write_osc52_clipboard(writer, copy.content.as_bytes()) {
+                Ok(()) => CopyFeedback {
+                    message: match copy.kind {
+                        CopyKind::Selection => format!("Copied {length} chars"),
+                        CopyKind::FullOutput => format!("Copied all ({length} chars)"),
+                    },
+                    error: false,
+                },
+                Err(error) => CopyFeedback {
+                    message: format!("Copy failed: {error}"),
+                    error: true,
+                },
+            },
+        );
+    }
+
     fn selected_job(&self) -> Option<&Job> {
         self.job_list_state
             .selected()
@@ -1259,27 +1757,59 @@ impl App {
     }
 
     fn select_next_job(&mut self) {
+        let previous = self.job_list_state.selected();
         self.job_list_state.select_next();
+        if previous != self.job_list_state.selected() {
+            self.clear_output_selection();
+        }
     }
 
     fn select_previous_job(&mut self) {
+        let previous = self.job_list_state.selected();
         self.job_list_state.select_previous();
+        if previous != self.job_list_state.selected() {
+            self.clear_output_selection();
+        }
     }
 
     fn select_first_job(&mut self) {
+        let previous = self.job_list_state.selected();
         self.job_list_state.select_first();
+        if previous != self.job_list_state.selected() {
+            self.clear_output_selection();
+        }
     }
 
     fn select_last_job(&mut self) {
+        let previous = self.job_list_state.selected();
         self.job_list_state.select_last();
+        if previous != self.job_list_state.selected() {
+            self.clear_output_selection();
+        }
     }
 
     fn scroll_jobs_half_page_down(&mut self) {
-        self.job_list_state.scroll_down_by(self.job_list_height / 2);
+        self.scroll_jobs_down_by(self.job_list_height / 2);
     }
 
     fn scroll_jobs_half_page_up(&mut self) {
-        self.job_list_state.scroll_up_by(self.job_list_height / 2);
+        self.scroll_jobs_up_by(self.job_list_height / 2);
+    }
+
+    fn scroll_jobs_down_by(&mut self, amount: u16) {
+        let previous = self.job_list_state.selected();
+        self.job_list_state.scroll_down_by(amount);
+        if previous != self.job_list_state.selected() {
+            self.clear_output_selection();
+        }
+    }
+
+    fn scroll_jobs_up_by(&mut self, amount: u16) {
+        let previous = self.job_list_state.selected();
+        self.job_list_state.scroll_up_by(amount);
+        if previous != self.job_list_state.selected() {
+            self.clear_output_selection();
+        }
     }
 
     fn job_index_at(&self, column: u16, row: u16) -> Option<usize> {
@@ -1330,6 +1860,28 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
         && column < rect.x.saturating_add(rect.width)
         && row >= rect.y
         && row < rect.y.saturating_add(rect.height)
+}
+
+fn grapheme_cell_at_display_column(
+    source: &str,
+    start_byte: usize,
+    end_byte: usize,
+    display_column: usize,
+) -> (usize, usize) {
+    let mut source_column = 0usize;
+    for (relative_byte, grapheme) in source[start_byte..end_byte].grapheme_indices(true) {
+        let grapheme_end_column = source_column.saturating_add(display_width(grapheme));
+        let grapheme_start_byte = start_byte + relative_byte;
+        if display_column < grapheme_end_column {
+            return (grapheme_start_byte, grapheme_start_byte + grapheme.len());
+        }
+        source_column = grapheme_end_column;
+    }
+    (end_byte, end_byte)
+}
+
+fn write_osc52_clipboard(writer: &mut impl Write, content: &[u8]) -> io::Result<()> {
+    execute!(writer, CopyToClipboard::to_clipboard_from(content))
 }
 
 fn mouse_wheel_direction(
@@ -1473,10 +2025,139 @@ mod tests {
 
     #[test]
     fn test_fit_text_applies_horizontal_offset_without_wrapping() {
-        let text = fit_text("abcdef\n", 1, 3, ScrollAnchor::Top, 0, 2, false);
+        let (text, _) = render_output_text(
+            "abcdef\n",
+            OutputRenderOptions {
+                height: 1,
+                width: 3,
+                anchor: ScrollAnchor::Top,
+                offset: 0,
+                horizontal_offset: 2,
+                wrap: false,
+                selection: None,
+            },
+        );
 
         assert_eq!(text.lines.len(), 1);
         assert_eq!(text.lines[0].to_string(), "cde");
+    }
+
+    #[test]
+    fn visible_lines_map_top_and_bottom_vertical_offsets() {
+        let source = ["zero", "one", "two", "three"];
+
+        let top = visible_output_lines(&source, 2, 20, ScrollAnchor::Top, 1, false);
+        let bottom = visible_output_lines(&source, 2, 20, ScrollAnchor::Bottom, 1, false);
+
+        assert_eq!(
+            top.iter().map(|line| line.source_line).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(
+            bottom
+                .iter()
+                .map(|line| line.source_line)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+    }
+
+    #[test]
+    fn wrapped_lines_retain_source_byte_ranges() {
+        let source = ["abcdef"];
+        let lines = visible_output_lines(&source, 4, 3, ScrollAnchor::Top, 0, true);
+
+        assert_eq!(
+            lines,
+            [
+                RenderedOutputLine {
+                    source_line: 0,
+                    start_byte: 0,
+                    end_byte: 3,
+                    continuation: false,
+                },
+                RenderedOutputLine {
+                    source_line: 0,
+                    start_byte: 3,
+                    end_byte: 4,
+                    continuation: true,
+                },
+                RenderedOutputLine {
+                    source_line: 0,
+                    start_byte: 4,
+                    end_byte: 5,
+                    continuation: true,
+                },
+                RenderedOutputLine {
+                    source_line: 0,
+                    start_byte: 5,
+                    end_byte: 6,
+                    continuation: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn horizontal_columns_map_to_whole_unicode_graphemes() {
+        let source = "a测试b";
+
+        assert_eq!(
+            grapheme_cell_at_display_column(source, 0, source.len(), 2),
+            (1, 4)
+        );
+        assert_eq!(
+            grapheme_cell_at_display_column(source, 0, source.len(), 3),
+            (4, 7)
+        );
+    }
+
+    #[test]
+    fn selected_text_preserves_logical_newlines_and_unicode() {
+        let output = "zero\nab测试cd\nlast\n";
+        let selection = OutputSelection {
+            start: OutputPoint { line: 1, byte: 2 },
+            end: OutputPoint { line: 2, byte: 2 },
+        };
+
+        assert_eq!(
+            selected_output_text(output, selection).as_deref(),
+            Some("测试cd\nla")
+        );
+    }
+
+    #[test]
+    fn selection_highlight_survives_horizontal_clipping() {
+        let selection = OutputSelection {
+            start: OutputPoint { line: 0, byte: 2 },
+            end: OutputPoint { line: 0, byte: 4 },
+        };
+        let (text, _) = render_output_text(
+            "abcdef\n",
+            OutputRenderOptions {
+                height: 1,
+                width: 3,
+                anchor: ScrollAnchor::Top,
+                offset: 0,
+                horizontal_offset: 2,
+                wrap: false,
+                selection: Some(selection),
+            },
+        );
+
+        assert_eq!(text.lines[0].to_string(), "cde");
+        assert_eq!(text.lines[0].spans[0].style.bg, Some(Color::LightBlue));
+        assert_eq!(text.lines[0].spans[1].style.bg, Some(Color::LightBlue));
+        assert_eq!(text.lines[0].spans[2].style.bg, None);
+    }
+
+    #[test]
+    fn clipboard_copy_writes_osc52_sequence() {
+        let mut output = Vec::new();
+
+        write_osc52_clipboard(&mut output, b"hello").unwrap();
+
+        assert_eq!(output, b"\x1b]52;c;aGVsbG8=\x1b\\");
     }
 
     #[test]

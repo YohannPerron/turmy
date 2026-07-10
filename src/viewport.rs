@@ -151,6 +151,7 @@ pub fn clip_line(line: &Line<'_>, offset: usize, width: usize) -> Line<'static> 
     }
 }
 
+#[cfg(test)]
 pub fn wrap_line(text: &str, first_width: usize, continuation_width: usize) -> Vec<String> {
     if text.is_empty() {
         return vec![String::new()];
