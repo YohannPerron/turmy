@@ -61,22 +61,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: Setup | Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
-      - name: Setup | Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          override: true
-          profile: minimal
-          target: ${{ matrix.target }}
-
-      - name: Build | Build
-        uses: actions-rs/cargo@v1
+      - name: Build | Cross compile
+        uses: houseabsolute/actions-rust-cross@v1
         with:
           command: build
-          args: --release --locked --target ${{ matrix.target }}
-          use-cross: ${{ matrix.os == 'ubuntu-latest' }}
+          target: ${{ matrix.target }}
+          args: --release --locked
+          force-use-cross: true
 
       - name: Post Build | Prepare artifacts
         run: |
@@ -85,7 +78,7 @@ jobs:
           cd -
 
       - name: Release | Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.name }}
           path: ${{ matrix.name }}
@@ -99,7 +92,7 @@ jobs:
       contents: write
     steps:
       - name: Setup | Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
 
       - name: Setup | Checksums
         run: for file in turm-*/turm-*; do openssl dgst -sha256 -r "$file" | awk '{print $1}' > "${file}.sha256"; done
@@ -131,7 +124,7 @@ jobs:
           - runner: ubuntu-latest
             target: ppc64le
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -140,7 +133,7 @@ jobs:
           sccache: 'true'
           manylinux: auto
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-linux-${{ matrix.platform.target }}
           path: dist
@@ -162,7 +155,7 @@ jobs:
           - runner: ubuntu-latest
             target: armv7
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -171,7 +164,7 @@ jobs:
           sccache: 'true'
           manylinux: musllinux_1_2
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-musllinux-${{ matrix.platform.target }}
           path: dist
@@ -181,7 +174,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [upload_artifacts, maturin_linux, maturin_musllinux] # only publish if everything else worked
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
       - name: Publish to PyPI
         uses: PyO3/maturin-action@v1
         env:
@@ -197,6 +190,6 @@ jobs:
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
     steps:
-    - uses: actions/checkout@v5
+    - uses: actions/checkout@v7
     - name: Publish
       run: cargo publish

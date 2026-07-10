@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::{io::BufRead, process::Command, thread, time::Duration};
 
-use crossbeam::channel::Sender;
+use crossbeam_channel::Sender;
 use regex::Regex;
 
 // see https://slurm.schedmd.com/sbatch.html#SECTION_%3CB%3Efilename-pattern%3C/B%3E

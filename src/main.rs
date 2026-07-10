@@ -8,7 +8,7 @@ use clap::CommandFactory;
 use clap::Parser;
 use clap::Subcommand;
 use clap_complete::{Shell, generate};
-use crossbeam::channel::{Sender, unbounded};
+use crossbeam_channel::{Sender, unbounded};
 use crossterm::{
     cursor::Show,
     event::{

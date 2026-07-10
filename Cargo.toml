@@ -6,17 +6,17 @@ description = "A TUI for the Slurm Workload Manager."
 repository = "https://github.com/karimknaebel/turm"
 license = "MIT"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.88"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-clap = { version = "4.5.40", features = ["derive"] }
-clap_complete = "4.5.54"
-crossbeam = "0.8.4"
-crossterm = "0.29.0"
-itertools = "0.14.0"
-notify = "8.0.0"
-ratatui = "0.30.0"
-regex = "1.11.1"
-tui-input = { version = "0.14.0", default-features = false, features = ["crossterm"] }
+clap = { version = "4.6.1", features = ["derive"] }
+clap_complete = "4.6.7"
+crossbeam-channel = "0.5.16"
+crossterm = { version = "0.29.0", features = ["osc52"] }
+itertools = "0.15.0"
+notify = "8.2.0"
+ratatui = "0.30.2"
+regex = "1.13.0"
+tui-input = { version = "0.15.3", default-features = false, features = ["crossterm"] }
