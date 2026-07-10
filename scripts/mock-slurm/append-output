@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+job_id="${1:-1001}"
+if (($#)); then
+    shift
+fi
+
+# Initialize the fixture files if the simulator has not been run yet.
+"$script_dir/bin/squeue" >/dev/null
+
+output_file="$script_dir/logs/job-$job_id.out"
+if [[ ! -f "$output_file" ]]; then
+    printf 'Unknown simulated job: %s\n' "$job_id" >&2
+    exit 1
+fi
+
+if (($#)); then
+    message="$*"
+else
+    message="Appended simulator output at $(date '+%Y-%m-%d %H:%M:%S')"
+fi
+
+printf '%s\n' "$message" >>"$output_file"
+printf 'Appended to %s\n' "$output_file"

@@ -7,25 +7,142 @@ log_dir="$root_dir/scripts/mock-slurm/logs"
 
 mkdir -p "$log_dir"
 
-stdout_running="$log_dir/job-1001.out"
-stderr_running="$log_dir/job-1001.err"
-stdout_pending="$log_dir/job-1002.out"
-stderr_pending="$log_dir/job-1002.err"
+initialize_output_files() {
+    local stdout_running="$log_dir/job-1001.out"
+    local stderr_running="$log_dir/job-1001.err"
 
-if [ ! -f "$stdout_running" ]; then
-    cat >"$stdout_running" <<'EOF'
-Starting training loop...
-Epoch 1/50 - loss=1.8421
-Epoch 2/50 - loss=1.5033
-EOF
-fi
+    if [[ ! -f "$stdout_running" ]]; then
+        {
+            printf '%s\n' \
+                'Starting deterministic training simulation...' \
+                'Configuration: model=very-long-transformer-name batch_size=64 learning_rate=0.0003 dataset=/shared/datasets/image-classification/2026-07/train' \
+                'Unicode sample for selection and width handling: naive=naive accented=naïve café | CJK=测试文本 | emoji=🚀'
+            for ((step = 1; step <= 80; step++)); do
+                printf 'Step %03d/080 | loss=%d.%04d | accuracy=%d.%02d%% | gpu_memory=18342MiB | samples_per_second=512\n' \
+                    "$step" "$((20000 / (step + 10)))" "$((step * 137 % 10000))" \
+                    "$((70 + step / 4))" "$((step * 17 % 100))"
+            done
+            printf '%s\n' \
+                'LONG-LINE: abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -- end'
+        } >"$stdout_running"
+    fi
 
-if [ ! -f "$stderr_running" ]; then
-    : >"$stderr_running"
-fi
+    if [[ ! -f "$stderr_running" ]]; then
+        printf '%s\n' \
+            'warning: this is simulated stderr' \
+            'warning: checkpoint upload is intentionally slow in the local simulator' \
+            >"$stderr_running"
+    fi
+
+    local id
+    for ((id = 1002; id <= 1022; id++)); do
+        if [[ ! -f "$log_dir/job-$id.out" ]]; then
+            printf 'Simulated output for job %s\nResult directory: /shared/very/long/path/to/results/job-%s/run-0001\nMetric summary: validation_loss=0.1234 validation_accuracy=98.76%% samples=50000\n' \
+                "$id" "$id" >"$log_dir/job-$id.out"
+        fi
+        if [[ ! -f "$log_dir/job-$id.err" ]]; then
+            : >"$log_dir/job-$id.err"
+        fi
+    done
+}
 
 sep='###turm###'
 
-printf '%s\n' \
-"1001${sep}train-model${sep}RUNNING${sep}${USER:-mock}${sep}00:12:37${sep}01:00:00${sep}N/A${sep}cpu=4,mem=8G${sep}debug${sep}mac-mini-01${sep}${stdout_running}${sep}${stderr_running}${sep}python train.py --epochs 50${sep}R${sep}None${sep}1001${sep}N/A${sep}mac-mini-01${sep}${root_dir}${sep}" \
-"1002${sep}eval-suite${sep}PENDING${sep}${USER:-mock}${sep}0:00${sep}00:30:00${sep}2026-03-04T12:00:00${sep}cpu=2,mem=4G${sep}debug${sep}(null)${sep}${stdout_pending}${sep}${stderr_pending}${sep}python eval.py --dataset validation${sep}PD${sep}Resources${sep}1002${sep}N/A${sep}(null)${sep}${root_dir}${sep}"
+emit_job() {
+    local first=true
+    local field
+    for field in "$@"; do
+        if [[ "$first" == true ]]; then
+            first=false
+        else
+            printf '%s' "$sep"
+        fi
+        printf '%s' "$field"
+    done
+    printf '%s\n' "$sep"
+}
+
+initialize_output_files
+
+mock_user="${USER:-mock-user}"
+
+emit_job \
+    '1001' \
+    'train-very-wide-transformer-model-with-a-long-descriptive-name' \
+    'RUNNING' \
+    "$mock_user" \
+    '00:12:37' \
+    '01:00:00' \
+    'N/A' \
+    'cpu=16,mem=128G,gres/gpu:a100=4,billing=16' \
+    'gpu-long-partition-name' \
+    'gpu-node-with-a-deliberately-long-hostname-017' \
+    "$log_dir/job-1001.out" \
+    "$log_dir/job-1001.err" \
+    'python -m training.launch --config configs/experiments/very-long-transformer-training-configuration.yaml --output /shared/results/2026-07-10/run-0001' \
+    'R' \
+    'None' \
+    '1001' \
+    'N/A' \
+    'gpu-node-with-a-deliberately-long-hostname-017' \
+    "$root_dir"
+
+emit_job \
+    '1002' \
+    'evaluation-suite-waiting-for-gpu-resources' \
+    'PENDING' \
+    "$mock_user" \
+    '0:00' \
+    '00:30:00' \
+    '2026-07-10T15:30:00' \
+    'cpu=2,mem=4G,gres/gpu:1' \
+    'gpu-long-partition-name' \
+    '(null)' \
+    "$log_dir/job-1002.out" \
+    "$log_dir/job-1002.err" \
+    'python eval.py --dataset validation --checkpoint /shared/checkpoints/transformer/checkpoint-50000.pt' \
+    'PD' \
+    'Resources' \
+    '1002' \
+    'N/A' \
+    '(null)' \
+    "$root_dir"
+
+for ((id = 1003; id <= 1022; id++)); do
+    if ((id % 4 == 0)); then
+        state='PENDING'
+        compact='PD'
+        reason='Priority'
+        node='(null)'
+        start='2026-07-10T16:00:00'
+        elapsed='0:00'
+    else
+        state='RUNNING'
+        compact='R'
+        reason='None'
+        node="compute-node-$((id - 980))"
+        start='N/A'
+        elapsed="00:$((id % 60)):$(printf '%02d' "$((id * 7 % 60))")"
+    fi
+
+    emit_job \
+        "$id" \
+        "parameter-sweep-experiment-$id-with-long-variant-name" \
+        "$state" \
+        "$mock_user" \
+        "$elapsed" \
+        '04:00:00' \
+        "$start" \
+        'cpu=8,mem=32G,gres/gpu:1' \
+        'shared-research-partition' \
+        "$node" \
+        "$log_dir/job-$id.out" \
+        "$log_dir/job-$id.err" \
+        "python sweep.py --experiment $id --parameter-grid configs/large-grid.yaml --results /shared/results/sweep/$id" \
+        "$compact" \
+        "$reason" \
+        "$id" \
+        'N/A' \
+        "$node" \
+        "$root_dir"
+done

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+find "$script_dir/logs" -type f ! -name '.gitkeep' -delete
+"$script_dir/bin/squeue" >/dev/null
+
+printf 'Reset mock Slurm state in %s\n' "$script_dir/logs"

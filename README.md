@@ -81,13 +81,29 @@ However, since inotify notifications are not supported for remote file systems, 
 
 ## Development without Slurm
 
-For local UI testing, this repository includes mocks for `squeue`, `scancel`, and `scontrol`:
+For local UI testing, this repository includes a deterministic Slurm simulator with
+mock implementations of `squeue`, `scancel`, and `scontrol`. It provides enough jobs
+and output to exercise vertical and horizontal scrolling without a Slurm install:
 
 ```shell
-PATH=scripts/mock-slurm/bin:$PATH cargo run -- --me
+./scripts/mock-slurm/run --me
 ```
 
-The mock commands read/write files in `scripts/mock-slurm/logs`, so you can test log rendering and control actions without a Slurm install.
+The simulated queue is static. To test live output updates, append one line to a job:
+
+```shell
+./scripts/mock-slurm/append-output 1001 "A new simulated training message"
+```
+
+To restore the original fixture output:
+
+```shell
+./scripts/mock-slurm/reset
+```
+
+The mock commands read and write `scripts/mock-slurm/logs`. Calls to `scancel` and
+`scontrol` are recorded there, so cancel, signal, and time-limit actions can be
+tested without affecting a real cluster.
 
 ## Star History
 
