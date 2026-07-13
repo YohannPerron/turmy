@@ -1,7 +1,7 @@
 use crossbeam_channel::{Receiver, TryRecvError, select, unbounded};
 use std::{cmp::min, io::Write, path::PathBuf, process::Command, time::Duration};
 
-use crate::file_watcher::{FileWatcherError, FileWatcherHandle};
+use crate::file_watcher::{FileWatcherError, FileWatcherHandle, FileWatcherUpdate, LogTextDecoder};
 use crate::job_watcher::JobWatcherHandle;
 use crate::viewport::{Pane, PaneViewport, clip_line, display_width};
 
@@ -108,7 +108,9 @@ pub struct App {
     dialog: Option<Dialog>,
     jobs: Vec<Job>,
     job_list_state: ListState,
-    job_output: Result<String, FileWatcherError>,
+    job_output: String,
+    job_output_error: Option<FileWatcherError>,
+    job_output_decoder: LogTextDecoder,
     job_output_anchor: ScrollAnchor,
     job_output_offset: u16,
     job_output_wrap: bool,
@@ -165,7 +167,7 @@ impl Job {
 
 pub enum AppMessage {
     Jobs(Vec<Job>),
-    JobOutput(Result<String, FileWatcherError>),
+    JobOutput(FileWatcherUpdate),
     Key(KeyEvent),
     MouseFocus(Pane),
     MouseClick(usize),
@@ -217,7 +219,9 @@ impl App {
                 squeue_args,
             ),
             job_list_state: ListState::default(),
-            job_output: Ok("".to_string()),
+            job_output: String::new(),
+            job_output_error: None,
+            job_output_decoder: LogTextDecoder::default(),
             job_output_anchor: ScrollAnchor::Bottom,
             job_output_offset: 0,
             job_output_wrap: false,
@@ -439,12 +443,31 @@ impl App {
                     self.clear_output_selection();
                 }
             }
-            AppMessage::JobOutput(content) => {
-                self.job_output_content_width = match &content {
-                    Ok(output) => output.lines().map(display_width).max().unwrap_or_default(),
-                    Err(error) => display_width(&error.to_string()),
-                };
-                self.job_output = content;
+            AppMessage::JobOutput(update) => {
+                match update {
+                    FileWatcherUpdate::Reset => {
+                        self.job_output.clear();
+                        self.job_output_error = None;
+                        self.job_output_decoder.reset();
+                        self.clear_output_selection();
+                    }
+                    FileWatcherUpdate::Append(bytes) => {
+                        self.job_output_decoder.push(&bytes, &mut self.job_output);
+                        self.job_output_error = None;
+                    }
+                    FileWatcherUpdate::Error(error) => self.job_output_error = Some(error),
+                }
+                self.job_output_content_width = self
+                    .job_output_error
+                    .as_ref()
+                    .map(|error| display_width(&error.to_string()))
+                    .unwrap_or_else(|| {
+                        self.job_output
+                            .lines()
+                            .map(display_width)
+                            .max()
+                            .unwrap_or_default()
+                    });
             }
             AppMessage::Key(key) => {
                 if self.dialog.is_some() {
@@ -1098,10 +1121,10 @@ impl App {
         //     "".to_string()
         // });
 
-        let (log_text, rendered_output_lines, log_error) = match self.job_output.as_deref() {
-            Ok(s) => {
+        let (log_text, rendered_output_lines, log_error) = match &self.job_output_error {
+            None => {
                 let (text, lines) = render_output_text(
-                    s,
+                    &self.job_output,
                     OutputRenderOptions {
                         height: log_inner.height as usize,
                         width: log_inner.width as usize,
@@ -1114,7 +1137,7 @@ impl App {
                 );
                 (text, lines, false)
             }
-            Err(e) => (Text::from(e.to_string()), Vec::new(), true),
+            Some(error) => (Text::from(error.to_string()), Vec::new(), true),
         };
         self.rendered_output_lines = rendered_output_lines;
         let mut log = Paragraph::new(log_text).block(log_block);
@@ -1333,7 +1356,7 @@ fn render_output_text(
     output: &str,
     options: OutputRenderOptions,
 ) -> (Text<'static>, Vec<RenderedOutputLine>) {
-    let source_lines = completed_output_lines(output);
+    let source_lines = output_lines(output);
     let rendered_lines = visible_output_lines(
         &source_lines,
         options.height,
@@ -1360,14 +1383,8 @@ fn render_output_text(
     (text, rendered_lines)
 }
 
-fn completed_output_lines(output: &str) -> Vec<&str> {
-    let completed = output
-        .rsplit_once(['\r', '\n'])
-        .map_or(output, |(completed, _)| completed);
-    completed
-        .lines()
-        .flat_map(|line| line.split('\r'))
-        .collect()
+fn output_lines(output: &str) -> Vec<&str> {
+    output.lines().flat_map(|line| line.split('\r')).collect()
 }
 
 fn visible_output_lines(
@@ -1527,7 +1544,7 @@ fn selected_output_text(output: &str, selection: OutputSelection) -> Option<Stri
     if selection.start >= selection.end {
         return None;
     }
-    let lines = completed_output_lines(output);
+    let lines = output_lines(output);
     let first = *lines.get(selection.start.line)?;
     let last = *lines.get(selection.end.line)?;
     if selection.start.byte > first.len()
@@ -1579,8 +1596,10 @@ impl App {
         let column = column.clamp(area.x, area.x.saturating_add(area.width - 1));
         let row = row.clamp(area.y, area.y.saturating_add(area.height - 1));
         let rendered = *self.rendered_output_lines.get((row - area.y) as usize)?;
-        let output = self.job_output.as_ref().ok()?;
-        let source_lines = completed_output_lines(output);
+        if self.job_output_error.is_some() {
+            return None;
+        }
+        let source_lines = output_lines(&self.job_output);
         let source = *source_lines.get(rendered.source_line)?;
         let screen_column = (column - area.x) as usize;
 
@@ -1641,10 +1660,10 @@ impl App {
 
     fn copy_selected_output(&mut self) {
         let content = self.output_selection.and_then(|selection| {
-            self.job_output
-                .as_ref()
-                .ok()
-                .and_then(|output| selected_output_text(output, selection))
+            self.job_output_error
+                .is_none()
+                .then(|| selected_output_text(&self.job_output, selection))
+                .flatten()
         });
         match content {
             Some(content) if !content.is_empty() => {
@@ -1665,9 +1684,9 @@ impl App {
 
     fn copy_full_output(&mut self) {
         let content = self
-            .job_output
-            .as_ref()
-            .ok()
+            .job_output_error
+            .is_none()
+            .then_some(&self.job_output)
             .filter(|output| !output.is_empty());
         match content {
             Some(content) => {
@@ -2040,6 +2059,25 @@ mod tests {
 
         assert_eq!(text.lines.len(), 1);
         assert_eq!(text.lines[0].to_string(), "cde");
+    }
+
+    #[test]
+    fn live_progress_is_rendered_before_its_final_newline() {
+        let (text, _) = render_output_text(
+            "Starting workload\nTraining:  34%|██████████",
+            OutputRenderOptions {
+                height: 2,
+                width: 80,
+                anchor: ScrollAnchor::Bottom,
+                offset: 0,
+                horizontal_offset: 0,
+                wrap: false,
+                selection: None,
+            },
+        );
+
+        assert_eq!(text.lines.len(), 2);
+        assert_eq!(text.lines[1].to_string(), "Training:  34%|██████████");
     }
 
     #[test]
