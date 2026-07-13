@@ -26,6 +26,7 @@ use tui_input::{Input, backend::crossterm::EventHandler};
 use unicode_segmentation::UnicodeSegmentation;
 
 pub enum Dialog {
+    Help,
     ConfirmCancelJob(String),
     SelectCancelSignal { id: String, selected_signal: usize },
     EditTimeLimit { id: String, input: Input },
@@ -477,6 +478,12 @@ impl App {
                     let mut command_failure = None;
 
                     match self.dialog.as_mut().expect("dialog must exist") {
+                        Dialog::Help => match key.code {
+                            KeyCode::Char('?') | KeyCode::Enter | KeyCode::Esc => {
+                                close_dialog = true;
+                            }
+                            _ => {}
+                        },
                         Dialog::ConfirmCancelJob(id) => match key.code {
                             KeyCode::Enter | KeyCode::Char('y') => {
                                 scancel_request = Some((id.clone(), None));
@@ -552,6 +559,7 @@ impl App {
                     }
                 } else {
                     match key.code {
+                        KeyCode::Char('?') => self.dialog = Some(Dialog::Help),
                         KeyCode::Char('c' | 'C')
                             if key.modifiers.contains(KeyModifiers::CONTROL) =>
                         {
@@ -818,22 +826,7 @@ impl App {
             .split(master_detail[1]);
 
         // Help
-        let help_options = vec![
-            ("q", "quit"),
-            ("tab", "pane"),
-            ("⏶/⏷", "vertical"),
-            ("◀/▶", "horizontal"),
-            ("pgup/pgdown", "page"),
-            ("home/end", "top/bottom"),
-            ("esc", "cancel"),
-            ("enter", "confirm"),
-            ("c/C", "cancel/signal"),
-            ("ctrl+c/y", "copy selection"),
-            ("Y", "copy all output"),
-            ("t", "set time limit"),
-            ("o", "toggle stdout/stderr"),
-            ("w", "toggle text wrap"),
-        ];
+        let help_options = [("?", "help"), ("tab", "pane"), ("q", "quit")];
         let blue_style = Style::default().fg(Color::Blue);
         let light_blue_style = Style::default().fg(Color::LightBlue);
 
@@ -1156,6 +1149,35 @@ impl App {
 
         if let Some(dialog) = &self.dialog {
             match dialog {
+                Dialog::Help => {
+                    let content = Text::from(vec![
+                        Line::from("Keyboard"),
+                        Line::from("  Tab / Shift-Tab       Focus next / previous pane"),
+                        Line::from("  Up/Down or j/k         Select or vertically scroll"),
+                        Line::from("  Left/Right or h/l      Horizontally scroll focused pane"),
+                        Line::from("  PgUp/PgDown, Ctrl-u/d  Scroll by a page / half page"),
+                        Line::from("  Home/End or g/G        Move to the beginning / end"),
+                        Line::from("  c / C / t              Cancel / signal / set time limit"),
+                        Line::from("  o / w                  Stdout/stderr / output wrapping"),
+                        Line::from("  y or Ctrl-c / Y        Copy selection / all output"),
+                        Line::default(),
+                        Line::from("Mouse"),
+                        Line::from("  Click                  Focus a pane or select a job"),
+                        Line::from("  Drag in output         Select text"),
+                        Line::from("  Wheel / Shift-wheel    Vertical / horizontal scroll"),
+                        Line::default(),
+                        Line::from("Copy uses OSC 52 and requires terminal support."),
+                        Line::from("Press ?, Enter, or Esc to close help."),
+                    ]);
+                    render_dialog(
+                        f,
+                        "Help",
+                        Color::Green,
+                        19,
+                        content,
+                        Some(Wrap { trim: false }),
+                    );
+                }
                 Dialog::ConfirmCancelJob(id) => {
                     let content = Text::from(Line::from(vec![
                         Span::raw("Cancel job "),
