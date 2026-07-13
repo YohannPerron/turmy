@@ -4,4 +4,27 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 export PATH="$script_dir/bin:$PATH"
 
-exec cargo run -- "$@"
+progress_pid=''
+
+cleanup() {
+    if [[ -n "$progress_pid" ]]; then
+        kill "$progress_pid" 2>/dev/null || true
+        wait "$progress_pid" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT INT TERM
+
+# Build first so the progress updates start when the TUI is ready rather than while Rust compiles.
+cargo build
+
+if [[ "${TURM_MOCK_TQDM:-1}" != '0' ]]; then
+    if ! command -v uv >/dev/null 2>&1; then
+        printf 'uv is required for the default tqdm simulation\n' >&2
+        exit 1
+    fi
+    "$script_dir/bin/squeue" >/dev/null
+    "$script_dir/tqdm-progress" 1001 >/dev/null 2>&1 &
+    progress_pid=$!
+fi
+
+cargo run -- "$@"

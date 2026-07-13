@@ -1,0 +1,78 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "tqdm>=4.67,<5",
+# ]
+# ///
+"""Append a live tqdm progress bar to a simulated Slurm job's stderr."""
+
+from __future__ import annotations
+
+import argparse
+import subprocess
+import time
+from pathlib import Path
+
+from tqdm import tqdm
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Write a live tqdm progress bar to a mock Slurm stderr log."
+    )
+    parser.add_argument("job_id", nargs="?", default="1001")
+    parser.add_argument("--steps", type=int, default=1_000)
+    parser.add_argument("--delay", type=float, default=0.1)
+    args = parser.parse_args()
+    if args.steps < 1:
+        parser.error("--steps must be at least 1")
+    if args.delay < 0:
+        parser.error("--delay cannot be negative")
+    return args
+
+
+def main() -> None:
+    args = parse_args()
+
+    # Initialize the fixture files if the simulator has not been run yet.
+    subprocess.run(
+        [SCRIPT_DIR / "bin" / "squeue"],
+        stdout=subprocess.DEVNULL,
+        check=True,
+    )
+
+    output_file = SCRIPT_DIR / "logs" / f"job-{args.job_id}.err"
+    if not output_file.is_file():
+        raise SystemExit(f"Unknown simulated job: {args.job_id}")
+
+    needs_newline = output_file.stat().st_size > 0
+    if needs_newline:
+        with output_file.open("rb") as stream:
+            stream.seek(-1, 2)
+            needs_newline = stream.read(1) != b"\n"
+
+    with output_file.open("a", encoding="utf-8") as stream:
+        if needs_newline:
+            stream.write("\n")
+        stream.write("Starting simulated Python tqdm workload\n")
+        stream.flush()
+        for _ in tqdm(
+            range(args.steps),
+            desc="Training",
+            file=stream,
+            mininterval=0,
+            miniters=1,
+            ncols=80,
+        ):
+            time.sleep(args.delay)
+        stream.write("Simulated tqdm workload complete\n")
+        stream.flush()
+
+    print(f"Wrote tqdm progress to {output_file}")
+
+
+if __name__ == "__main__":
+    main()
