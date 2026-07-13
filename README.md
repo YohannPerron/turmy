@@ -62,6 +62,39 @@ In your `config.fish` or in a separate `completions/turm.fish` file, add the fol
 turm completion fish | source
 ```
 
+## Controls
+
+Press `?` in `turm` to open the complete keyboard and mouse help. The focused pane
+has a green border. Use `Tab` and `Shift-Tab` to move focus between the job list,
+job details, and job output panes.
+
+| Action | Keyboard | Mouse |
+| --- | --- | --- |
+| Select or vertically scroll | `Up`/`Down` or `j`/`k` | Wheel over a pane |
+| Scroll by half a page | `Ctrl-u` / `Ctrl-d` | |
+| Scroll by a page | `PageUp` / `PageDown` | |
+| Go to the beginning or end | `Home`/`End` or `g`/`G` | |
+| Scroll horizontally | `Left`/`Right` or `h`/`l` | `Shift`+wheel |
+| Select output text | | Drag in the output pane |
+| Copy selected output | `y` or `Ctrl-c` | |
+| Copy all output | `Y` | |
+| Toggle stdout/stderr | `o` | |
+| Toggle output wrapping | `w` | |
+| Cancel, signal, or set a time limit | `c`, `C`, or `t` | |
+| Quit | `q` | |
+
+Horizontal output scrolling is disabled while wrapping is enabled. Modifier keys
+(`Shift`, `Ctrl`, or `Alt`) make keyboard horizontal scrolling faster.
+
+### Clipboard support
+
+Copying uses the OSC 52 terminal escape sequence so that it can work across SSH.
+The terminal emulator must support OSC 52 and permit clipboard writes. Terminal
+multiplexers such as tmux or screen, nested SSH sessions, and terminal security
+settings may block or limit it. A “Copied” status means `turm` successfully wrote
+the copy request to the terminal; OSC 52 does not provide confirmation that the
+desktop clipboard accepted it.
+
 ## How it works
 
 `turm` obtains information about jobs by parsing the output of `squeue`.
@@ -89,10 +122,20 @@ and output to exercise vertical and horizontal scrolling without a Slurm install
 ./scripts/mock-slurm/run --me
 ```
 
+The simulator uses `uv` to start a live Python `tqdm` progress bar for job 1001
+by default. Select that job and press `o` to watch its stderr output. Set
+`TURM_MOCK_TQDM=0` when running the simulator to disable the progress task.
+
 The simulated queue is static. To test live output updates, append one line to a job:
 
 ```shell
 ./scripts/mock-slurm/append-output 1001 "A new simulated training message"
+```
+
+To replay the Python `tqdm` progress bar, run this in another terminal:
+
+```shell
+./scripts/mock-slurm/tqdm-progress 1001
 ```
 
 To restore the original fixture output:
