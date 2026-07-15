@@ -2130,7 +2130,7 @@ dependencies = [
 
 [[package]]
 name = "turmy"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "clap",
  "clap_complete",
