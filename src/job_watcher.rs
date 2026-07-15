@@ -29,7 +29,7 @@ impl JobWatcher {
         }
     }
 
-    const OUTPUT_SEPARATOR: &'static str = "###turm###";
+    const OUTPUT_SEPARATOR: &'static str = "###turmy###";
     const FIELDS: [&'static str; 19] = [
         "jobid",
         "name",
@@ -105,6 +105,7 @@ impl JobWatcher {
             partition: partition.to_owned(),
             nodelist: nodelist.to_owned(),
             command: command.to_owned(),
+            finished: false,
             stdout: Self::resolve_path(
                 stdout,
                 array_job_id,
@@ -134,14 +135,19 @@ impl JobWatcher {
             .join(",");
 
         loop {
-            let jobs: Vec<Job> = Command::new("squeue")
+            let output = Command::new("squeue")
                 .args(&self.squeue_args)
                 .arg("--array")
                 .arg("--noheader")
                 .arg("--Format")
                 .arg(&output_format)
                 .output()
-                .expect("failed to execute process")
+                .expect("failed to execute process");
+            if !output.status.success() {
+                thread::sleep(self.interval);
+                continue;
+            }
+            let jobs: Vec<Job> = output
                 .stdout
                 .lines()
                 .map(|l| l.unwrap().trim().to_string())
@@ -267,6 +273,7 @@ mod tests {
         assert_eq!(job.state, "RUNNING");
         assert_eq!(job.user, "alice");
         assert_eq!(job.state_compact, "R");
+        assert!(!job.finished);
         assert_eq!(job.reason, None, "reason 'None' should map to Option::None");
         assert_eq!(job.array_id, "12345");
         assert_eq!(

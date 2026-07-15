@@ -7,15 +7,15 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug executable 'turm'",
+            "name": "Debug executable 'turmy'",
             "cargo": {
                 "args": [
                     "build",
-                    "--bin=turm",
-                    "--package=turm"
+                    "--bin=turmy",
+                    "--package=turmy"
                 ],
                 "filter": {
-                    "name": "turm",
+                    "name": "turmy",
                     "kind": "bin"
                 }
             },
@@ -28,16 +28,16 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug unit tests in executable 'turm'",
+            "name": "Debug unit tests in executable 'turmy'",
             "cargo": {
                 "args": [
                     "test",
                     "--no-run",
-                    "--bin=turm",
-                    "--package=turm"
+                    "--bin=turmy",
+                    "--package=turmy"
                 ],
                 "filter": {
-                    "name": "turm",
+                    "name": "turmy",
                     "kind": "bin"
                 }
             },

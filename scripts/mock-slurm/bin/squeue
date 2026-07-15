@@ -46,7 +46,7 @@ initialize_output_files() {
     done
 }
 
-sep='###turm###'
+sep='###turmy###'
 
 emit_job() {
     local first=true

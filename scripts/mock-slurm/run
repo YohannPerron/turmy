@@ -17,7 +17,7 @@ trap cleanup EXIT INT TERM
 # Build first so the progress updates start when the TUI is ready rather than while Rust compiles.
 cargo build
 
-if [[ "${TURM_MOCK_TQDM:-1}" != '0' ]]; then
+if [[ "${TURMY_MOCK_TQDM:-1}" != '0' ]]; then
     if ! command -v uv >/dev/null 2>&1; then
         printf 'uv is required for the default tqdm simulation\n' >&2
         exit 1

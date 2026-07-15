@@ -1,5 +1,7 @@
 use crossbeam_channel::{Receiver, TryRecvError, select, unbounded};
-use std::{cmp::min, io::Write, path::PathBuf, process::Command, time::Duration};
+use std::{
+    cmp::min, collections::HashSet, io::Write, path::PathBuf, process::Command, time::Duration,
+};
 
 use crate::file_watcher::{FileWatcherError, FileWatcherHandle, FileWatcherUpdate, LogTextDecoder};
 use crate::job_watcher::JobWatcherHandle;
@@ -107,7 +109,9 @@ struct CopyFeedback {
 pub struct App {
     focus: Pane,
     dialog: Option<Dialog>,
+    remembered_jobs: Vec<Job>,
     jobs: Vec<Job>,
+    show_finished_jobs: bool,
     job_list_state: ListState,
     job_output: String,
     job_output_error: Option<FileWatcherError>,
@@ -137,6 +141,7 @@ pub struct App {
     copy_feedback: Option<CopyFeedback>,
 }
 
+#[derive(Clone, Debug)]
 pub struct Job {
     pub job_id: String,
     pub array_id: String,
@@ -155,6 +160,7 @@ pub struct Job {
     pub stdout: Option<PathBuf>,
     pub stderr: Option<PathBuf>,
     pub command: String,
+    pub finished: bool,
 }
 
 impl Job {
@@ -213,7 +219,9 @@ impl App {
         Self {
             focus: Pane::Jobs,
             dialog: None,
+            remembered_jobs: Vec::new(),
             jobs: Vec::new(),
+            show_finished_jobs: false,
             _job_watcher: JobWatcherHandle::new(
                 sender.clone(),
                 Duration::from_secs(slurm_refresh_rate),
@@ -421,28 +429,9 @@ impl App {
     fn handle(&mut self, msg: AppMessage) {
         match msg {
             AppMessage::Jobs(jobs) => {
-                // On refresh: keep the same job selected if it still exists
-                let old_index = self.job_list_state.selected();
-                let old_id = old_index.and_then(|i| self.jobs.get(i)).map(|j| j.id());
-                let previous_id = old_id.clone();
-
-                self.jobs = jobs;
-
-                if self.jobs.is_empty() {
-                    self.job_list_state.select(None);
-                } else if let Some(id) = old_id {
-                    let new_index = self
-                        .jobs
-                        .iter()
-                        .position(|j| j.id() == id)
-                        .unwrap_or(old_index.unwrap_or(0).min(self.jobs.len() - 1));
-                    self.job_list_state.select(Some(new_index));
-                } else {
-                    self.job_list_state.select_first();
-                }
-                if previous_id != self.selected_job_id() {
-                    self.clear_output_selection();
-                }
+                self.remembered_jobs =
+                    remember_finished_jobs(std::mem::take(&mut self.remembered_jobs), jobs);
+                self.rebuild_visible_jobs();
             }
             AppMessage::JobOutput(update) => {
                 match update {
@@ -567,6 +556,10 @@ impl App {
                         }
                         KeyCode::Char('y') => self.copy_selected_output(),
                         KeyCode::Char('Y') => self.copy_full_output(),
+                        KeyCode::Char('f') => {
+                            self.show_finished_jobs = !self.show_finished_jobs;
+                            self.rebuild_visible_jobs();
+                        }
                         KeyCode::Tab => self.focus_next_panel(),
                         KeyCode::BackTab => self.focus_previous_panel(),
                         KeyCode::Char('h') | KeyCode::Left => {
@@ -680,20 +673,20 @@ impl App {
                             }
                         },
                         KeyCode::Char('c') if key.modifiers.is_empty() => {
-                            if let Some(id) = self.selected_job_id() {
-                                self.dialog = Some(Dialog::ConfirmCancelJob(id));
+                            if let Some(job) = self.selected_active_job() {
+                                self.dialog = Some(Dialog::ConfirmCancelJob(job.id()));
                             }
                         }
                         KeyCode::Char('C') => {
-                            if let Some(id) = self.selected_job_id() {
+                            if let Some(job) = self.selected_active_job() {
                                 self.dialog = Some(Dialog::SelectCancelSignal {
-                                    id,
+                                    id: job.id(),
                                     selected_signal: 0,
                                 });
                             }
                         }
                         KeyCode::Char('t') => {
-                            if let Some(job) = self.selected_job() {
+                            if let Some(job) = self.selected_active_job() {
                                 self.dialog = Some(Dialog::EditTimeLimit {
                                     id: job.id(),
                                     input: Input::new(job.time_limit.clone()),
@@ -826,7 +819,12 @@ impl App {
             .split(master_detail[1]);
 
         // Help
-        let help_options = [("?", "help"), ("tab", "pane"), ("q", "quit")];
+        let help_options = [
+            ("?", "help"),
+            ("f", "finished"),
+            ("tab", "pane"),
+            ("q", "quit"),
+        ];
         let blue_style = Style::default().fg(Color::Blue);
         let light_blue_style = Style::default().fg(Color::LightBlue);
 
@@ -866,7 +864,7 @@ impl App {
             .jobs
             .iter()
             .map(|j| {
-                Line::from(vec![
+                let line = Line::from(vec![
                     Span::styled(
                         format!(
                             "{:<max$.max$}",
@@ -897,7 +895,12 @@ impl App {
                     ),
                     Span::raw(" "),
                     Span::raw(&j.name),
-                ])
+                ]);
+                if j.finished {
+                    line.style(Style::default().add_modifier(Modifier::DIM))
+                } else {
+                    line
+                }
             })
             .collect();
         let jobs_content_width = job_lines.iter().map(Line::width).max().unwrap_or_default();
@@ -914,13 +917,23 @@ impl App {
                 ))
             })
             .collect();
+        let finished_count = self
+            .remembered_jobs
+            .iter()
+            .filter(|job| job.finished)
+            .count();
+        let jobs_title = match (finished_count, self.show_finished_jobs) {
+            (0, _) => format!("Jobs ({})", self.jobs.len()),
+            (_, true) => format!("Jobs ({}, {finished_count} finished)", self.jobs.len()),
+            (_, false) => format!(
+                "Jobs ({}, {finished_count} finished hidden)",
+                self.jobs.len()
+            ),
+        };
         let job_list = List::new(jobs)
             .block(
                 Block::default()
-                    .title(pane_title(
-                        &format!("Jobs ({})", self.jobs.len()),
-                        jobs_viewport,
-                    ))
+                    .title(pane_title(&jobs_title, jobs_viewport))
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(pane_border_style(
@@ -1159,6 +1172,7 @@ impl App {
                         Line::from("  Home/End or g/G        Move to the beginning / end"),
                         Line::from("  c / C / t              Cancel / signal / set time limit"),
                         Line::from("  o / w                  Stdout/stderr / output wrapping"),
+                        Line::from("  f                      Show / hide finished jobs"),
                         Line::from("  y or Ctrl-c / Y        Copy selection / all output"),
                         Line::default(),
                         Line::from("Mouse"),
@@ -1173,7 +1187,7 @@ impl App {
                         f,
                         "Help",
                         Color::Green,
-                        19,
+                        20,
                         content,
                         Some(Wrap { trim: false }),
                     );
@@ -1294,6 +1308,34 @@ fn pane_border_style(focused: Pane, pane: Pane, dialog_open: bool) -> Style {
     } else {
         Style::default()
     }
+}
+
+fn remember_finished_jobs(previous: Vec<Job>, mut current: Vec<Job>) -> Vec<Job> {
+    for job in &mut current {
+        job.finished = false;
+    }
+    let current_ids = current.iter().map(Job::id).collect::<HashSet<_>>();
+
+    current.extend(previous.into_iter().filter_map(|mut job| {
+        (!current_ids.contains(&job.id())).then(|| {
+            if !job.finished {
+                job.finished = true;
+                job.state = "FINISHED".to_string();
+                job.state_compact = "F".to_string();
+                job.reason = None;
+            }
+            job
+        })
+    }));
+    current
+}
+
+fn visible_jobs(remembered: &[Job], show_finished: bool) -> Vec<Job> {
+    remembered
+        .iter()
+        .filter(|job| show_finished || !job.finished)
+        .cloned()
+        .collect()
 }
 
 fn horizontal_indicator(viewport: PaneViewport) -> Option<String> {
@@ -1755,8 +1797,38 @@ impl App {
             .and_then(|i| self.jobs.get(i))
     }
 
+    fn selected_active_job(&self) -> Option<&Job> {
+        self.selected_job().filter(|job| !job.finished)
+    }
+
     fn selected_job_id(&self) -> Option<String> {
         self.selected_job().map(Job::id)
+    }
+
+    fn rebuild_visible_jobs(&mut self) {
+        let old_index = self.job_list_state.selected();
+        let previous_id = old_index
+            .and_then(|index| self.jobs.get(index))
+            .map(Job::id);
+
+        self.jobs = visible_jobs(&self.remembered_jobs, self.show_finished_jobs);
+
+        if self.jobs.is_empty() {
+            self.job_list_state.select(None);
+        } else if let Some(id) = previous_id.as_deref() {
+            let new_index = self
+                .jobs
+                .iter()
+                .position(|job| job.id() == id)
+                .unwrap_or(old_index.unwrap_or(0).min(self.jobs.len() - 1));
+            self.job_list_state.select(Some(new_index));
+        } else {
+            self.job_list_state.select_first();
+        }
+
+        if previous_id != self.selected_job_id() {
+            self.clear_output_selection();
+        }
     }
 
     fn focus_next_panel(&mut self) {
@@ -2043,6 +2115,77 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
+
+    fn test_job(id: &str) -> Job {
+        Job {
+            job_id: id.to_string(),
+            array_id: id.to_string(),
+            array_step: None,
+            name: format!("job-{id}"),
+            state: "RUNNING".to_string(),
+            state_compact: "R".to_string(),
+            reason: None,
+            user: "user".to_string(),
+            time: "00:01".to_string(),
+            time_limit: "01:00:00".to_string(),
+            start_time: "N/A".to_string(),
+            tres: "cpu=1".to_string(),
+            partition: "debug".to_string(),
+            nodelist: "node01".to_string(),
+            stdout: None,
+            stderr: None,
+            command: "true".to_string(),
+            finished: false,
+        }
+    }
+
+    #[test]
+    fn disappeared_jobs_are_remembered_and_can_be_filtered() {
+        let previous = vec![test_job("1"), test_job("2")];
+        let mut refreshed_job = test_job("2");
+        refreshed_job.time = "00:02".to_string();
+
+        let remembered = remember_finished_jobs(previous, vec![refreshed_job]);
+
+        assert_eq!(remembered.len(), 2);
+        assert_eq!(remembered[0].id(), "2");
+        assert_eq!(remembered[0].time, "00:02");
+        assert!(!remembered[0].finished);
+        assert_eq!(remembered[1].id(), "1");
+        assert_eq!(remembered[1].state, "FINISHED");
+        assert_eq!(remembered[1].state_compact, "F");
+        assert!(remembered[1].finished);
+
+        assert_eq!(
+            visible_jobs(&remembered, false)
+                .iter()
+                .map(Job::id)
+                .collect::<Vec<_>>(),
+            ["2"]
+        );
+        assert_eq!(
+            visible_jobs(&remembered, true)
+                .iter()
+                .map(Job::id)
+                .collect::<Vec<_>>(),
+            ["2", "1"]
+        );
+    }
+
+    #[test]
+    fn reappearing_job_becomes_active_again() {
+        let remembered = remember_finished_jobs(vec![test_job("1")], Vec::new());
+        assert!(remembered[0].finished);
+
+        let mut reappeared = test_job("1");
+        reappeared.time = "00:03".to_string();
+        let remembered = remember_finished_jobs(remembered, vec![reappeared]);
+
+        assert_eq!(remembered.len(), 1);
+        assert_eq!(remembered[0].state, "RUNNING");
+        assert_eq!(remembered[0].time, "00:03");
+        assert!(!remembered[0].finished);
+    }
 
     #[test]
     fn test_mouse_wheel_direction() {
