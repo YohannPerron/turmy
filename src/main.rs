@@ -2,6 +2,7 @@ mod app;
 mod file_watcher;
 mod job_watcher;
 mod squeue_args;
+mod updater;
 mod viewport;
 
 use app::App;
@@ -25,11 +26,15 @@ use ratatui::{
 };
 use squeue_args::SqueueArgs;
 use std::io::Write;
-use std::{io, panic, thread};
+use std::{error::Error, io, panic, thread};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
+    /// Check GitHub for a newer release and offer to install it.
+    #[arg(long, exclusive = true)]
+    update: bool,
+
     /// Refresh rate for the job watcher.
     #[arg(long, value_name = "SECONDS", default_value_t = 2)]
     slurm_refresh: u64,
@@ -55,8 +60,12 @@ enum CliCommand {
     },
 }
 
-fn main() -> io::Result<()> {
+fn main() -> Result<(), Box<dyn Error>> {
     let args = Cli::parse();
+    if args.update {
+        return updater::run();
+    }
+
     match args.command {
         Some(CliCommand::Completion { shell }) => {
             let cmd = &mut Cli::command();
@@ -69,7 +78,7 @@ fn main() -> io::Result<()> {
     install_panic_hook();
 
     let mut terminal_guard = TerminalGuard::new(io::stdout())?;
-    run_app(terminal_guard.terminal_mut(), args)
+    Ok(run_app(terminal_guard.terminal_mut(), args)?)
 }
 
 fn install_panic_hook() {

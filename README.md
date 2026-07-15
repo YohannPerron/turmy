@@ -52,6 +52,17 @@ wget https://github.com/YohannPerron/turmy/releases/latest/download/turmy-x86_64
 Other Linux architectures are available on the
 [`turmy` release page](https://github.com/YohannPerron/turmy/releases).
 
+To check for a newer GitHub release and optionally replace the currently
+installed binary, run:
+
+```shell
+turmy --update
+```
+
+The update runs entirely in the terminal, asks before installing, and verifies
+the downloaded release archive against its published SHA-256 checksum before
+extracting or replacing the executable.
+
 ### Shell Completion (optional)
 
 #### Bash
