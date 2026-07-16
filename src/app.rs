@@ -207,6 +207,7 @@ pub(crate) enum MouseWheelDirection {
 
 const SCANCEL_SIGNALS: &[&str] = &["TERM", "INT", "HUP", "USR1", "USR2", "STOP", "CONT", "KILL"];
 const DIALOG_WIDTH: u16 = 80;
+const SHIFT_WHEEL_SCROLL_MULTIPLIER: u16 = 3;
 
 impl App {
     pub fn new(
@@ -384,11 +385,17 @@ impl App {
                         return (false, false);
                     };
                     let direction = mouse_wheel_direction(mouse.kind, mouse.modifiers).unwrap();
+                    let scroll_multiplier =
+                        mouse_wheel_scroll_multiplier(mouse.kind, mouse.modifiers);
                     let mut amount = 1u16;
                     while let Some(next_event) = self.try_recv_input_event() {
                         let should_merge = if let Event::Mouse(next_mouse) = &next_event {
                             mouse_wheel_direction(next_mouse.kind, next_mouse.modifiers)
                                 == Some(direction)
+                                && mouse_wheel_scroll_multiplier(
+                                    next_mouse.kind,
+                                    next_mouse.modifiers,
+                                ) == scroll_multiplier
                                 && self.pane_at(next_mouse.column, next_mouse.row) == Some(target)
                         } else {
                             false
@@ -400,6 +407,7 @@ impl App {
                             break;
                         }
                     }
+                    amount = amount.saturating_mul(scroll_multiplier);
                     self.handle(AppMessage::MouseWheel {
                         target,
                         direction,
@@ -2016,9 +2024,19 @@ fn mouse_wheel_direction(
 fn horizontal_scroll_amount(key: KeyEvent) -> usize {
     if key
         .modifiers
-        .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL | KeyModifiers::ALT)
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
     {
         10
+    } else {
+        1
+    }
+}
+
+fn mouse_wheel_scroll_multiplier(kind: MouseEventKind, modifiers: KeyModifiers) -> u16 {
+    if matches!(kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
+        && modifiers.contains(KeyModifiers::SHIFT)
+    {
+        SHIFT_WHEEL_SCROLL_MULTIPLIER
     } else {
         1
     }
@@ -2204,6 +2222,41 @@ mod tests {
         assert_eq!(
             mouse_wheel_direction(MouseEventKind::Down(MouseButton::Left), KeyModifiers::NONE),
             None
+        );
+    }
+
+    #[test]
+    fn control_but_not_shift_accelerates_horizontal_keyboard_scrolling() {
+        assert_eq!(
+            horizontal_scroll_amount(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)),
+            1
+        );
+        assert_eq!(
+            horizontal_scroll_amount(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT)),
+            1
+        );
+        assert_eq!(
+            horizontal_scroll_amount(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)),
+            10
+        );
+        assert_eq!(
+            horizontal_scroll_amount(KeyEvent::new(
+                KeyCode::Right,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )),
+            10
+        );
+    }
+
+    #[test]
+    fn only_shift_wheel_gets_the_horizontal_scroll_multiplier() {
+        assert_eq!(
+            mouse_wheel_scroll_multiplier(MouseEventKind::ScrollDown, KeyModifiers::SHIFT),
+            3
+        );
+        assert_eq!(
+            mouse_wheel_scroll_multiplier(MouseEventKind::ScrollRight, KeyModifiers::NONE),
+            1
         );
     }
 

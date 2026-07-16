@@ -108,8 +108,9 @@ job details, and job output panes.
 | Cancel, signal, or set a time limit | `c`, `C`, or `t` | |
 | Quit | `q` | |
 
-Horizontal output scrolling is disabled while wrapping is enabled. Modifier keys
-(`Shift`, `Ctrl`, or `Alt`) make keyboard horizontal scrolling faster.
+Horizontal output scrolling is disabled while wrapping is enabled. `Ctrl` or `Alt`
+makes keyboard horizontal scrolling faster; `Shift` is reserved for horizontal
+mouse-wheel scrolling.
 
 When a previously visible job disappears from a successful `squeue` refresh,
 `turmy` remembers it as finished for the rest of the current session. Finished jobs
