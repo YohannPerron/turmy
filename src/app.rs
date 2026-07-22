@@ -587,16 +587,22 @@ impl App {
                         KeyCode::Char('l') | KeyCode::Right => {
                             self.scroll_focused_horizontal_right(horizontal_scroll_amount(key))
                         }
-                        KeyCode::Char('k') | KeyCode::Up => match self.focus {
-                            Pane::Jobs => self.select_previous_job(),
-                            Pane::Details => {}
-                            Pane::Output => self.scroll_job_output_up_by(1),
-                        },
-                        KeyCode::Char('j') | KeyCode::Down => match self.focus {
-                            Pane::Jobs => self.select_next_job(),
-                            Pane::Details => {}
-                            Pane::Output => self.scroll_job_output_down_by(1),
-                        },
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            let amount = vertical_scroll_amount(key);
+                            match self.focus {
+                                Pane::Jobs => self.scroll_jobs_up_by(amount),
+                                Pane::Details => {}
+                                Pane::Output => self.scroll_job_output_up_by(amount),
+                            }
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            let amount = vertical_scroll_amount(key);
+                            match self.focus {
+                                Pane::Jobs => self.scroll_jobs_down_by(amount),
+                                Pane::Details => {}
+                                Pane::Output => self.scroll_job_output_down_by(amount),
+                            }
+                        }
                         KeyCode::Char('g') => match self.focus {
                             Pane::Jobs => self.select_first_job(),
                             Pane::Details => {
@@ -1194,6 +1200,7 @@ impl App {
                         Line::from("  Tab / Shift-Tab       Focus next / previous pane"),
                         Line::from("  Up/Down or j/k         Select or vertically scroll"),
                         Line::from("  Left/Right or h/l      Horizontally scroll focused pane"),
+                        Line::from("  Ctrl/Alt + arrows      Scroll 10 lines / columns"),
                         Line::from("  PgUp/PgDown, Ctrl-u/d  Scroll by a page / half page"),
                         Line::from("  Home/End or g/G        Move to the beginning / end"),
                         Line::from("  c / C / t              Cancel / signal / set time limit"),
@@ -1213,7 +1220,7 @@ impl App {
                         f,
                         "Help",
                         Color::Green,
-                        20,
+                        21,
                         content,
                         Some(Wrap { trim: false }),
                     );
@@ -1901,22 +1908,6 @@ impl App {
         }
     }
 
-    fn select_next_job(&mut self) {
-        let previous = self.job_list_state.selected();
-        self.job_list_state.select_next();
-        if previous != self.job_list_state.selected() {
-            self.clear_output_selection();
-        }
-    }
-
-    fn select_previous_job(&mut self) {
-        let previous = self.job_list_state.selected();
-        self.job_list_state.select_previous();
-        if previous != self.job_list_state.selected() {
-            self.clear_output_selection();
-        }
-    }
-
     fn select_first_job(&mut self) {
         let previous = self.job_list_state.selected();
         self.job_list_state.select_first();
@@ -1943,7 +1934,15 @@ impl App {
 
     fn scroll_jobs_down_by(&mut self, amount: u16) {
         let previous = self.job_list_state.selected();
-        self.job_list_state.scroll_down_by(amount);
+        if self.jobs.is_empty() {
+            self.job_list_state.select(None);
+        } else {
+            let selected = previous.unwrap_or_default();
+            let selected = selected
+                .saturating_add(amount as usize)
+                .min(self.jobs.len() - 1);
+            self.job_list_state.select(Some(selected));
+        }
         if previous != self.job_list_state.selected() {
             self.clear_output_selection();
         }
@@ -1951,7 +1950,11 @@ impl App {
 
     fn scroll_jobs_up_by(&mut self, amount: u16) {
         let previous = self.job_list_state.selected();
-        self.job_list_state.scroll_up_by(amount);
+        if self.jobs.is_empty() {
+            self.job_list_state.select(None);
+        } else {
+            self.job_list_state.scroll_up_by(amount);
+        }
         if previous != self.job_list_state.selected() {
             self.clear_output_selection();
         }
@@ -2049,6 +2052,18 @@ fn horizontal_scroll_amount(key: KeyEvent) -> usize {
     if key
         .modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        10
+    } else {
+        1
+    }
+}
+
+fn vertical_scroll_amount(key: KeyEvent) -> u16 {
+    if matches!(key.code, KeyCode::Up | KeyCode::Down)
+        && key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
     {
         10
     } else {
@@ -2305,6 +2320,30 @@ mod tests {
                 KeyModifiers::CONTROL | KeyModifiers::SHIFT,
             )),
             10
+        );
+    }
+
+    #[test]
+    fn control_or_alt_accelerates_vertical_arrow_scrolling() {
+        assert_eq!(
+            vertical_scroll_amount(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            1
+        );
+        assert_eq!(
+            vertical_scroll_amount(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT)),
+            1
+        );
+        assert_eq!(
+            vertical_scroll_amount(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL)),
+            10
+        );
+        assert_eq!(
+            vertical_scroll_amount(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT)),
+            10
+        );
+        assert_eq!(
+            vertical_scroll_amount(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)),
+            1
         );
     }
 

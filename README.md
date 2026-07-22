@@ -111,8 +111,8 @@ job details, and job output panes.
 | Quit | `q` | |
 
 Horizontal output scrolling is disabled while wrapping is enabled. `Ctrl` or `Alt`
-makes keyboard horizontal scrolling faster; `Shift` is reserved for horizontal
-mouse-wheel scrolling.
+with an arrow key scrolls ten lines or columns at a time; `Shift` is reserved for
+horizontal mouse-wheel scrolling.
 
 When a previously visible job disappears from a successful `squeue` refresh,
 `turmy` remembers it as finished for the rest of the current session. Finished jobs
