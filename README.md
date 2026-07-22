@@ -32,6 +32,8 @@ This version is based on upstream commit
 - **Remembered finished jobs:** retain jobs that disappear from a successful
   `squeue` refresh, toggle them with `f`, and keep their output paths available
   for the rest of the current session.
+- **Pending job-array fusion:** show pending array elements as compact Slurm
+  ranges such as `35804_[80-500]`, while running elements remain individual.
 - **Discoverability:** provide a compact footer, a complete in-app help dialog
   opened with `?`, and expanded control documentation.
 - **Development support:** expand the deterministic mock Slurm environment with

@@ -146,6 +146,7 @@ pub struct Job {
     pub job_id: String,
     pub array_id: String,
     pub array_step: Option<String>,
+    pub array_task_count: usize,
     pub name: String,
     pub state: String,
     pub state_compact: String,
@@ -165,10 +166,20 @@ pub struct Job {
 
 impl Job {
     fn id(&self) -> String {
+        if self.job_id.contains("_[") {
+            return self.job_id.clone();
+        }
         match self.array_step.as_ref() {
+            Some(array_step) if self.array_task_count > 1 => {
+                format!("{}_[{}]", self.array_id, array_step)
+            }
             Some(array_step) => format!("{}_{}", self.array_id, array_step),
             None => self.job_id.clone(),
         }
+    }
+
+    fn is_aggregated_array(&self) -> bool {
+        self.array_task_count > 1 || self.job_id.contains("_[")
     }
 }
 
@@ -1010,18 +1021,25 @@ impl App {
                     OutputFileView::Stdout => "stdout ",
                     OutputFileView::Stderr => "stderr ",
                 };
+                let output_path = if j.is_aggregated_array() {
+                    if j.array_task_count > 1 {
+                        format!("Aggregated array ({} tasks)", j.array_task_count)
+                    } else {
+                        "Aggregated array".to_string()
+                    }
+                } else {
+                    match self.output_file_view {
+                        OutputFileView::Stdout => &j.stdout,
+                        OutputFileView::Stderr => &j.stderr,
+                    }
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+                };
                 let stdout = Line::from(vec![
                     Span::styled(ui_stdout_text, Style::default().fg(Color::Yellow)),
                     Span::raw(" "),
-                    Span::raw(
-                        match self.output_file_view {
-                            OutputFileView::Stdout => &j.stdout,
-                            OutputFileView::Stderr => &j.stderr,
-                        }
-                        .as_ref()
-                        .map(|p| p.to_str().unwrap_or_default())
-                        .unwrap_or_default(),
-                    ),
+                    Span::raw(output_path),
                 ]);
 
                 vec![state, name, command, nodes, tres, stdout]
@@ -1323,9 +1341,15 @@ fn remember_finished_jobs(previous: Vec<Job>, mut current: Vec<Job>) -> Vec<Job>
         job.finished = false;
     }
     let current_ids = current.iter().map(Job::id).collect::<HashSet<_>>();
+    let current_array_ids = current
+        .iter()
+        .filter_map(|job| job.array_step.as_ref().map(|_| job.array_id.clone()))
+        .collect::<HashSet<_>>();
 
     current.extend(previous.into_iter().filter_map(|mut job| {
-        (!current_ids.contains(&job.id())).then(|| {
+        let replaced_array_range =
+            job.array_task_count > 1 && current_array_ids.contains(job.array_id.as_str());
+        (!current_ids.contains(&job.id()) && !replaced_array_range).then(|| {
             if !job.finished {
                 job.finished = true;
                 job.state = "FINISHED".to_string();
@@ -2139,6 +2163,7 @@ mod tests {
             job_id: id.to_string(),
             array_id: id.to_string(),
             array_step: None,
+            array_task_count: 1,
             name: format!("job-{id}"),
             state: "RUNNING".to_string(),
             state_compact: "R".to_string(),
@@ -2155,6 +2180,18 @@ mod tests {
             command: "true".to_string(),
             finished: false,
         }
+    }
+
+    fn test_array_job(array_id: &str, task_id: u64, state: &str) -> Job {
+        let mut job = test_job(&format!("{array_id}_{task_id}"));
+        job.array_id = array_id.to_string();
+        job.array_step = Some(task_id.to_string());
+        job.name = format!("array-{array_id}");
+        job.state = state.to_string();
+        job.state_compact = if state == "PENDING" { "PD" } else { "R" }.to_string();
+        job.stdout = Some(PathBuf::from(format!("/tmp/{array_id}_{task_id}.out")));
+        job.stderr = Some(PathBuf::from(format!("/tmp/{array_id}_{task_id}.err")));
+        job
     }
 
     #[test]
@@ -2203,6 +2240,29 @@ mod tests {
         assert_eq!(remembered[0].state, "RUNNING");
         assert_eq!(remembered[0].time, "00:03");
         assert!(!remembered[0].finished);
+    }
+
+    #[test]
+    fn changing_aggregated_pending_range_is_not_remembered_as_finished() {
+        let mut previous = test_array_job("35804", 0, "PENDING");
+        previous.array_step = Some("80-500".to_string());
+        previous.array_task_count = 421;
+        previous.stdout = None;
+        previous.stderr = None;
+
+        let mut remaining = previous.clone();
+        remaining.array_step = Some("81-500".to_string());
+        remaining.array_task_count = 420;
+        let running = test_array_job("35804", 80, "RUNNING");
+
+        let remembered = remember_finished_jobs(vec![previous], vec![remaining, running]);
+
+        assert_eq!(remembered.len(), 2);
+        assert!(remembered.iter().all(|job| !job.finished));
+        assert_eq!(
+            remembered.iter().map(Job::id).collect::<Vec<_>>(),
+            ["35804_[81-500]", "35804_80"]
+        );
     }
 
     #[test]

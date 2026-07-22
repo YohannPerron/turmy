@@ -81,6 +81,8 @@ impl JobWatcher {
         let array_task_id = parts[16];
         let node_list = parts[17];
         let working_dir = parts[18];
+        let array_task_count = Self::array_task_count(array_task_id).unwrap_or(1);
+        let aggregated_array = array_task_count > 1 || id.contains("_[");
 
         Some(Job {
             job_id: id.to_owned(),
@@ -89,6 +91,7 @@ impl JobWatcher {
                 "N/A" => None,
                 _ => Some(array_task_id.to_owned()),
             },
+            array_task_count,
             name: name.to_owned(),
             state: state.to_owned(),
             state_compact: state_compact.to_owned(),
@@ -106,26 +109,65 @@ impl JobWatcher {
             nodelist: nodelist.to_owned(),
             command: command.to_owned(),
             finished: false,
-            stdout: Self::resolve_path(
-                stdout,
-                array_job_id,
-                array_task_id,
-                id,
-                node_list,
-                user,
-                name,
-                working_dir,
-            ),
-            stderr: Self::resolve_path(
-                stderr,
-                array_job_id,
-                array_task_id,
-                id,
-                node_list,
-                user,
-                name,
-                working_dir,
-            ), // TODO fill all fields
+            stdout: if aggregated_array {
+                None
+            } else {
+                Self::resolve_path(
+                    stdout,
+                    array_job_id,
+                    array_task_id,
+                    id,
+                    node_list,
+                    user,
+                    name,
+                    working_dir,
+                )
+            },
+            stderr: if aggregated_array {
+                None
+            } else {
+                Self::resolve_path(
+                    stderr,
+                    array_job_id,
+                    array_task_id,
+                    id,
+                    node_list,
+                    user,
+                    name,
+                    working_dir,
+                )
+            }, // TODO fill all fields
+        })
+    }
+
+    fn array_task_count(expression: &str) -> Option<usize> {
+        if expression == "N/A" {
+            return Some(1);
+        }
+
+        let expression = expression.trim_start_matches('[').trim_end_matches(']');
+        let expression = expression
+            .split_once('%')
+            .map_or(expression, |(tasks, _)| tasks);
+        expression.split(',').try_fold(0usize, |count, part| {
+            let (range, stride) = part.split_once(':').map_or((part, 1), |(range, stride)| {
+                (range, stride.parse::<u64>().ok().unwrap_or(0))
+            });
+            if stride == 0 {
+                return None;
+            }
+            let part_count = if let Some((start, end)) = range.split_once('-') {
+                let start = start.parse::<u64>().ok()?;
+                let end = end.parse::<u64>().ok()?;
+                if end < start {
+                    return None;
+                }
+                ((end - start) / stride + 1).try_into().ok()?
+            } else {
+                range.parse::<u64>().ok()?;
+                1
+            };
+            count.checked_add(part_count)
         })
     }
 
@@ -137,7 +179,9 @@ impl JobWatcher {
         loop {
             let output = Command::new("squeue")
                 .args(&self.squeue_args)
-                .arg("--array")
+                // SQUEUE_ARRAY is equivalent to --array, which expands pending
+                // array elements instead of letting squeue fuse their ranges.
+                .env_remove("SQUEUE_ARRAY")
                 .arg("--noheader")
                 .arg("--Format")
                 .arg(&output_format)
@@ -313,6 +357,47 @@ mod tests {
             "numeric array_task_id should be preserved"
         );
         assert_eq!(job.reason, Some("Priority".to_owned()));
+    }
+
+    #[test]
+    fn parse_line_aggregated_array_expression() {
+        let line = make_line(&[
+            "35804_[80-82,85,88-90]",
+            "array-job",
+            "PENDING",
+            "bob",
+            "0:00",
+            "2:00:00",
+            "N/A",
+            "cpu=1",
+            "batch",
+            "(null)",
+            "/out/%A_%a.out",
+            "/out/%A_%a.err",
+            "/home/bob/run.sh",
+            "PD",
+            "Priority",
+            "35804",
+            "80-82,85,88-90",
+            "(null)",
+            "/home/bob",
+        ]);
+
+        let job = JobWatcher::parse_line(&line).expect("should parse");
+        assert_eq!(job.job_id, "35804_[80-82,85,88-90]");
+        assert_eq!(job.array_step.as_deref(), Some("80-82,85,88-90"));
+        assert_eq!(job.array_task_count, 7);
+        assert_eq!(job.stdout, None);
+        assert_eq!(job.stderr, None);
+    }
+
+    #[test]
+    fn array_task_count_supports_ranges_strides_and_concurrency_limits() {
+        assert_eq!(JobWatcher::array_task_count("80-500"), Some(421));
+        assert_eq!(JobWatcher::array_task_count("1-7:2%4"), Some(4));
+        assert_eq!(JobWatcher::array_task_count("[1-3,8,10-14:2]"), Some(7));
+        assert_eq!(JobWatcher::array_task_count("N/A"), Some(1));
+        assert_eq!(JobWatcher::array_task_count("1-3:0"), None);
     }
 
     #[test]
