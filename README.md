@@ -103,6 +103,7 @@ job details, and job output panes.
 | Go to the beginning or end | `Home`/`End` or `g`/`G` | |
 | Scroll horizontally | `Left`/`Right` or `h`/`l` | `Shift`+wheel |
 | Zoom or restore the focused pane | `z` | |
+| Filter output to matching lines | `/`, then `Enter` | |
 | Select output text | | Drag in the output pane |
 | Copy selected output | `y` or `Ctrl-c` | |
 | Copy all output | `Y` | |
@@ -115,6 +116,11 @@ job details, and job output panes.
 Horizontal output scrolling is disabled while wrapping is enabled. `Ctrl` or `Alt`
 with an arrow key scrolls ten lines or columns at a time; `Shift` is reserved for
 horizontal mouse-wheel scrolling.
+
+Output filtering is a case-sensitive literal search. Press `/`, enter a query, and
+press `Enter` to keep only matching stdout/stderr lines and highlight each match in
+red. Submit an empty query to clear the filter, or press `Esc` to leave it unchanged.
+Once a filter is active, press `Esc` outside the filter prompt to clear it.
 
 When a previously visible job disappears from a successful `squeue` refresh,
 `turmy` remembers it as finished for the rest of the current session. Finished jobs

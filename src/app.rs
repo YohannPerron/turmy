@@ -29,6 +29,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 pub enum Dialog {
     Help,
+    OutputFilter { input: Input },
     ConfirmCancelJob(String),
     SelectCancelSignal { id: String, selected_signal: usize },
     EditTimeLimit { id: String, input: Input },
@@ -80,7 +81,7 @@ struct RenderedOutputLine {
 }
 
 #[derive(Clone, Copy)]
-struct OutputRenderOptions {
+struct OutputRenderOptions<'a> {
     height: usize,
     width: usize,
     anchor: ScrollAnchor,
@@ -88,6 +89,7 @@ struct OutputRenderOptions {
     horizontal_offset: usize,
     wrap: bool,
     selection: Option<OutputSelection>,
+    filter: Option<&'a str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,6 +122,7 @@ pub struct App {
     job_output_anchor: ScrollAnchor,
     job_output_offset: u16,
     job_output_wrap: bool,
+    output_filter: Option<String>,
     _job_watcher: JobWatcherHandle,
     job_output_watcher: FileWatcherHandle,
     // sender: Sender<AppMessage>,
@@ -248,6 +251,7 @@ impl App {
             job_output_anchor: ScrollAnchor::Bottom,
             job_output_offset: 0,
             job_output_wrap: false,
+            output_filter: None,
             job_output_watcher: FileWatcherHandle::new(
                 sender.clone(),
                 Duration::from_secs(file_refresh_rate),
@@ -328,7 +332,7 @@ impl App {
     fn handle_input_event(&mut self, event: Event) -> (bool, bool) {
         match event {
             Event::Key(key) => {
-                if key.code == KeyCode::Char('q') {
+                if key.code == KeyCode::Char('q') && self.dialog.is_none() {
                     return (true, false);
                 }
                 self.handle(AppMessage::Key(key));
@@ -485,6 +489,7 @@ impl App {
                     let mut close_dialog = false;
                     let mut scancel_request = None;
                     let mut timelimit_request = None;
+                    let mut output_filter_request = None;
                     let mut command_failure = None;
 
                     match self.dialog.as_mut().expect("dialog must exist") {
@@ -493,6 +498,19 @@ impl App {
                                 close_dialog = true;
                             }
                             _ => {}
+                        },
+                        Dialog::OutputFilter { input } => match key.code {
+                            KeyCode::Enter => {
+                                let query = input.value().to_string();
+                                output_filter_request = Some((!query.is_empty()).then_some(query));
+                                close_dialog = true;
+                            }
+                            KeyCode::Esc => {
+                                close_dialog = true;
+                            }
+                            _ => {
+                                input.handle_event(&Event::Key(key));
+                            }
                         },
                         Dialog::ConfirmCancelJob(id) => match key.code {
                             KeyCode::Enter | KeyCode::Char('y') => {
@@ -562,6 +580,13 @@ impl App {
                     if let Some((id, time_limit)) = timelimit_request {
                         command_failure = execute_scontrol_update_timelimit(&id, &time_limit).err();
                     }
+                    if let Some(filter) = output_filter_request {
+                        self.output_filter = filter;
+                        self.job_output_offset = 0;
+                        self.job_output_anchor = ScrollAnchor::Top;
+                        self.output_viewport.reset_horizontal();
+                        self.clear_output_selection();
+                    }
                     if let Some(CommandFailure { command, output }) = command_failure {
                         self.dialog = Some(Dialog::CommandError { command, output });
                     } else if close_dialog {
@@ -570,6 +595,18 @@ impl App {
                 } else {
                     match key.code {
                         KeyCode::Char('?') => self.dialog = Some(Dialog::Help),
+                        KeyCode::Char('/') => {
+                            self.dialog = Some(Dialog::OutputFilter {
+                                input: Input::new(self.output_filter.clone().unwrap_or_default()),
+                            });
+                        }
+                        KeyCode::Esc if self.output_filter.is_some() => {
+                            self.output_filter = None;
+                            self.job_output_offset = 0;
+                            self.job_output_anchor = ScrollAnchor::Top;
+                            self.output_viewport.reset_horizontal();
+                            self.clear_output_selection();
+                        }
                         KeyCode::Char('c' | 'C')
                             if key.modifiers.contains(KeyModifiers::CONTROL) =>
                         {
@@ -850,6 +887,7 @@ impl App {
             ("f", "finished"),
             ("tab", "pane"),
             ("z", "zoom"),
+            ("/", "filter"),
             ("q", "quit"),
         ];
         let blue_style = Style::default().fg(Color::Blue);
@@ -1092,10 +1130,21 @@ impl App {
 
         // Log
         let log_area = output_area;
+        let filtered_content_width =
+            self.output_filter
+                .as_deref()
+                .map_or(self.job_output_content_width, |filter| {
+                    output_lines(&self.job_output)
+                        .into_iter()
+                        .filter(|line| line.contains(filter))
+                        .map(display_width)
+                        .max()
+                        .unwrap_or_default()
+                });
         let output_content_width = if self.job_output_wrap {
             log_area.width.saturating_sub(2) as usize
         } else {
-            self.job_output_content_width
+            filtered_content_width
         };
         self.output_viewport.update(log_area, output_content_width);
         if self.job_output_wrap {
@@ -1122,6 +1171,12 @@ impl App {
             log_title_spans.push(Span::styled(
                 indicator,
                 Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+        if let Some(filter) = &self.output_filter {
+            log_title_spans.push(Span::styled(
+                format!("[/{filter}]"),
+                Style::default().fg(Color::Red),
             ));
         }
         if let Some(feedback) = &self.copy_feedback {
@@ -1172,6 +1227,7 @@ impl App {
                         horizontal_offset: output_viewport.horizontal_offset(),
                         wrap: self.job_output_wrap,
                         selection: self.output_selection,
+                        filter: self.output_filter.as_deref(),
                     },
                 );
                 (text, lines, false)
@@ -1200,6 +1256,8 @@ impl App {
                         Line::from("Keyboard"),
                         Line::from("  Tab / Shift-Tab       Focus next / previous pane"),
                         Line::from("  z                      Zoom / restore focused pane"),
+                        Line::from("  /                      Filter output lines"),
+                        Line::from("  Esc                    Clear active output filter"),
                         Line::from("  Up/Down or j/k         Select or vertically scroll"),
                         Line::from("  Left/Right or h/l      Horizontally scroll focused pane"),
                         Line::from("  Ctrl/Alt + arrows      Scroll 10 lines / columns"),
@@ -1222,10 +1280,37 @@ impl App {
                         f,
                         "Help",
                         Color::Green,
-                        22,
+                        24,
                         content,
                         Some(Wrap { trim: false }),
                     );
+                }
+                Dialog::OutputFilter { input } => {
+                    let area = dialog_area(3, f.area());
+                    let inner = Block::default().borders(Borders::ALL).inner(area);
+                    let prompt = "Filter: ";
+                    let prompt_width = prompt.len() as u16;
+                    let available_width = inner.width.saturating_sub(prompt_width).max(1) as usize;
+                    let scroll = input.visual_scroll(available_width);
+                    let visible_value = input
+                        .value()
+                        .chars()
+                        .skip(scroll)
+                        .take(available_width)
+                        .collect::<String>();
+                    let content = Text::from(Line::from(vec![
+                        Span::raw(prompt),
+                        Span::styled(visible_value, Style::default().fg(Color::Red)),
+                    ]));
+
+                    let inner = render_dialog(f, "Output Filter", Color::Green, 3, content, None);
+                    let cursor_offset = input.visual_cursor().saturating_sub(scroll) as u16;
+                    let cursor_x = inner
+                        .x
+                        .saturating_add(prompt_width)
+                        .saturating_add(cursor_offset)
+                        .min(inner.x.saturating_add(inner.width.saturating_sub(1)));
+                    f.set_cursor_position((cursor_x, inner.y));
                 }
                 Dialog::ConfirmCancelJob(id) => {
                     let content = Text::from(Line::from(vec![
@@ -1489,6 +1574,7 @@ fn render_output_text(
         options.anchor,
         options.offset,
         options.wrap,
+        options.filter,
     );
     let text = Text::from(
         rendered_lines
@@ -1501,6 +1587,7 @@ fn render_output_text(
                     options.horizontal_offset,
                     options.wrap,
                     options.selection,
+                    options.filter,
                 )
             })
             .collect::<Vec<_>>(),
@@ -1519,11 +1606,19 @@ fn visible_output_lines(
     anchor: ScrollAnchor,
     offset: usize,
     wrap: bool,
+    filter: Option<&str>,
 ) -> Vec<RenderedOutputLine> {
     let mut rendered = Vec::new();
+    let matches_filter =
+        |index: &usize| filter.is_none_or(|filter| source_lines[*index].contains(filter));
     let source_indices: Box<dyn Iterator<Item = usize>> = match anchor {
-        ScrollAnchor::Top => Box::new(offset..source_lines.len()),
-        ScrollAnchor::Bottom => Box::new((0..source_lines.len()).rev().skip(offset)),
+        ScrollAnchor::Top => Box::new((0..source_lines.len()).filter(matches_filter).skip(offset)),
+        ScrollAnchor::Bottom => Box::new(
+            (0..source_lines.len())
+                .rev()
+                .filter(matches_filter)
+                .skip(offset),
+        ),
     };
 
     for source_line in source_indices {
@@ -1620,8 +1715,10 @@ fn render_output_line(
     horizontal_offset: usize,
     wrap: bool,
     selection: Option<OutputSelection>,
+    filter: Option<&str>,
 ) -> Line<'static> {
     let selection_style = Style::default().fg(Color::Black).bg(Color::LightBlue);
+    let match_style = Style::default().fg(Color::Red);
     let mut spans = Vec::new();
     if wrap && rendered.continuation {
         spans.push(Span::styled(
@@ -1636,6 +1733,11 @@ fn render_output_line(
         source
     };
     let base_byte = if wrap { rendered.start_byte } else { 0 };
+    let match_ranges = filter
+        .into_iter()
+        .flat_map(|filter| source.match_indices(filter))
+        .map(|(start, matched)| (start, start + matched.len()))
+        .collect::<Vec<_>>();
     for (relative_byte, grapheme) in source_slice.grapheme_indices(true) {
         let start = OutputPoint {
             line: rendered.source_line,
@@ -1647,10 +1749,15 @@ fn render_output_line(
         };
         let selected =
             selection.is_some_and(|selection| start < selection.end && end > selection.start);
+        let matched = match_ranges
+            .iter()
+            .any(|(match_start, match_end)| start.byte < *match_end && end.byte > *match_start);
         spans.push(Span::styled(
             grapheme.to_string(),
             if selected {
                 selection_style
+            } else if matched {
+                match_style
             } else {
                 Style::default()
             },
@@ -2414,6 +2521,7 @@ mod tests {
                 horizontal_offset: 2,
                 wrap: false,
                 selection: None,
+                filter: None,
             },
         );
 
@@ -2433,6 +2541,7 @@ mod tests {
                 horizontal_offset: 0,
                 wrap: false,
                 selection: None,
+                filter: None,
             },
         );
 
@@ -2441,11 +2550,49 @@ mod tests {
     }
 
     #[test]
+    fn output_filter_keeps_matching_lines_and_highlights_matches() {
+        let (text, rendered) = render_output_text(
+            "info\nfirst error here\nskip\nsecond error\n",
+            OutputRenderOptions {
+                height: 10,
+                width: 80,
+                anchor: ScrollAnchor::Top,
+                offset: 0,
+                horizontal_offset: 0,
+                wrap: false,
+                selection: None,
+                filter: Some("error"),
+            },
+        );
+
+        assert_eq!(
+            text.lines.iter().map(Line::to_string).collect::<Vec<_>>(),
+            ["first error here", "second error"]
+        );
+        assert_eq!(
+            rendered
+                .iter()
+                .map(|line| line.source_line)
+                .collect::<Vec<_>>(),
+            [1, 3]
+        );
+        for line in &text.lines {
+            let highlighted = line
+                .spans
+                .iter()
+                .filter(|span| span.style.fg == Some(Color::Red))
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            assert_eq!(highlighted, "error");
+        }
+    }
+
+    #[test]
     fn visible_lines_map_top_and_bottom_vertical_offsets() {
         let source = ["zero", "one", "two", "three"];
 
-        let top = visible_output_lines(&source, 2, 20, ScrollAnchor::Top, 1, false);
-        let bottom = visible_output_lines(&source, 2, 20, ScrollAnchor::Bottom, 1, false);
+        let top = visible_output_lines(&source, 2, 20, ScrollAnchor::Top, 1, false, None);
+        let bottom = visible_output_lines(&source, 2, 20, ScrollAnchor::Bottom, 1, false, None);
 
         assert_eq!(
             top.iter().map(|line| line.source_line).collect::<Vec<_>>(),
@@ -2463,7 +2610,7 @@ mod tests {
     #[test]
     fn wrapped_lines_retain_source_byte_ranges() {
         let source = ["abcdef"];
-        let lines = visible_output_lines(&source, 4, 3, ScrollAnchor::Top, 0, true);
+        let lines = visible_output_lines(&source, 4, 3, ScrollAnchor::Top, 0, true, None);
 
         assert_eq!(
             lines,
@@ -2540,6 +2687,7 @@ mod tests {
                 horizontal_offset: 2,
                 wrap: false,
                 selection: Some(selection),
+                filter: None,
             },
         );
 
