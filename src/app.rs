@@ -108,6 +108,7 @@ struct CopyFeedback {
 
 pub struct App {
     focus: Pane,
+    maximized_pane: Option<Pane>,
     dialog: Option<Dialog>,
     remembered_jobs: Vec<Job>,
     jobs: Vec<Job>,
@@ -230,6 +231,7 @@ impl App {
         let (sender, receiver) = unbounded();
         Self {
             focus: Pane::Jobs,
+            maximized_pane: None,
             dialog: None,
             remembered_jobs: Vec::new(),
             jobs: Vec::new(),
@@ -575,6 +577,12 @@ impl App {
                         }
                         KeyCode::Char('y') => self.copy_selected_output(),
                         KeyCode::Char('Y') => self.copy_full_output(),
+                        KeyCode::Char('z') => {
+                            self.maximized_pane = match self.maximized_pane {
+                                Some(_) => None,
+                                None => Some(self.focus),
+                            };
+                        }
                         KeyCode::Char('f') => {
                             self.show_finished_jobs = !self.show_finished_jobs;
                             self.rebuild_visible_jobs();
@@ -833,21 +841,15 @@ impl App {
             .constraints([Constraint::Min(3), Constraint::Length(1)].as_ref())
             .split(f.area());
 
-        let master_detail = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(50), Constraint::Percentage(70)].as_ref())
-            .split(content_help[0]);
-
-        let job_detail_log = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(8), Constraint::Min(3)].as_ref())
-            .split(master_detail[1]);
+        let (jobs_area, details_area, output_area) =
+            pane_areas(content_help[0], self.maximized_pane);
 
         // Help
         let help_options = [
             ("?", "help"),
             ("f", "finished"),
             ("tab", "pane"),
+            ("z", "zoom"),
             ("q", "quit"),
         ];
         let blue_style = Style::default().fg(Color::Blue);
@@ -929,8 +931,7 @@ impl App {
             })
             .collect();
         let jobs_content_width = job_lines.iter().map(Line::width).max().unwrap_or_default();
-        self.jobs_viewport
-            .update(master_detail[0], jobs_content_width);
+        self.jobs_viewport.update(jobs_area, jobs_content_width);
         let jobs_viewport = self.jobs_viewport;
         let jobs: Vec<ListItem> = job_lines
             .iter()
@@ -968,13 +969,13 @@ impl App {
                     )),
             )
             .highlight_style(Style::default().bg(Color::Green).fg(Color::Black));
-        f.render_stateful_widget(job_list, master_detail[0], &mut self.job_list_state);
+        f.render_stateful_widget(job_list, jobs_area, &mut self.job_list_state);
         render_horizontal_scrollbar(
             f,
             jobs_viewport,
             pane_border_style(self.focus, Pane::Jobs, self.dialog.is_some()),
         );
-        self.job_list_height = master_detail[0].height.saturating_sub(2); // account for borders
+        self.job_list_height = jobs_area.height.saturating_sub(2); // account for borders
 
         // Job details
 
@@ -1057,7 +1058,7 @@ impl App {
             .max()
             .unwrap_or_default();
         self.details_viewport
-            .update(job_detail_log[0], details_content_width);
+            .update(details_area, details_content_width);
         let details_viewport = self.details_viewport;
         let visible_job_details = Text::from(
             job_detail_lines
@@ -1082,7 +1083,7 @@ impl App {
                     self.dialog.is_some(),
                 )),
         );
-        f.render_widget(job_detail, job_detail_log[0]);
+        f.render_widget(job_detail, details_area);
         render_horizontal_scrollbar(
             f,
             details_viewport,
@@ -1090,7 +1091,7 @@ impl App {
         );
 
         // Log
-        let log_area = job_detail_log[1];
+        let log_area = output_area;
         let output_content_width = if self.job_output_wrap {
             log_area.width.saturating_sub(2) as usize
         } else {
@@ -1198,6 +1199,7 @@ impl App {
                     let content = Text::from(vec![
                         Line::from("Keyboard"),
                         Line::from("  Tab / Shift-Tab       Focus next / previous pane"),
+                        Line::from("  z                      Zoom / restore focused pane"),
                         Line::from("  Up/Down or j/k         Select or vertically scroll"),
                         Line::from("  Left/Right or h/l      Horizontally scroll focused pane"),
                         Line::from("  Ctrl/Alt + arrows      Scroll 10 lines / columns"),
@@ -1220,7 +1222,7 @@ impl App {
                         f,
                         "Help",
                         Color::Green,
-                        21,
+                        22,
                         content,
                         Some(Wrap { trim: false }),
                     );
@@ -1340,6 +1342,26 @@ fn pane_border_style(focused: Pane, pane: Pane, dialog_open: bool) -> Style {
         Style::default().fg(Color::Green)
     } else {
         Style::default()
+    }
+}
+
+fn pane_areas(area: Rect, maximized_pane: Option<Pane>) -> (Rect, Rect, Rect) {
+    match maximized_pane {
+        Some(Pane::Jobs) => (area, Rect::default(), Rect::default()),
+        Some(Pane::Details) => (Rect::default(), area, Rect::default()),
+        Some(Pane::Output) => (Rect::default(), Rect::default(), area),
+        None => {
+            let master_detail = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(50), Constraint::Percentage(70)].as_ref())
+                .split(area);
+            let job_detail_log = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(8), Constraint::Min(3)].as_ref())
+                .split(master_detail[1]);
+
+            (master_detail[0], job_detail_log[0], job_detail_log[1])
+        }
     }
 }
 
@@ -1872,10 +1894,16 @@ impl App {
 
     fn focus_next_panel(&mut self) {
         self.focus = self.focus.next();
+        if self.maximized_pane.is_some() {
+            self.maximized_pane = Some(self.focus);
+        }
     }
 
     fn focus_previous_panel(&mut self) {
         self.focus = self.focus.previous();
+        if self.maximized_pane.is_some() {
+            self.maximized_pane = Some(self.focus);
+        }
     }
 
     fn scroll_focused_horizontal_left(&mut self, amount: usize) {
@@ -2298,6 +2326,21 @@ mod tests {
             mouse_wheel_direction(MouseEventKind::Down(MouseButton::Left), KeyModifiers::NONE),
             None
         );
+    }
+
+    #[test]
+    fn maximized_pane_uses_the_full_content_area() {
+        let area = Rect::new(2, 3, 100, 40);
+
+        assert_eq!(
+            pane_areas(area, Some(Pane::Details)),
+            (Rect::default(), area, Rect::default())
+        );
+
+        let (jobs, details, output) = pane_areas(area, None);
+        assert!(jobs.width > 0);
+        assert!(details.height > 0);
+        assert!(output.height > 0);
     }
 
     #[test]

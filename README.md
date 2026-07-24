@@ -20,8 +20,9 @@ This version is based on upstream commit
 [`4e648db`](https://github.com/karimknaebel/turm/commit/4e648db) and adds:
 
 - **Pane navigation and scrolling:** focus the job list, details, or output with
-  `Tab`/`Shift-Tab`; scroll horizontally with the keyboard or mouse; and handle
-  Unicode display widths when clipping and wrapping text.
+  `Tab`/`Shift-Tab`; zoom the focused pane with `z`; scroll horizontally with the
+  keyboard or mouse; and handle Unicode display widths when clipping and wrapping
+  text.
 - **Output selection and copying:** select output with the mouse, copy the
   selection or the complete output, and send it through OSC 52 for remote/SSH
   terminal workflows.
@@ -101,6 +102,7 @@ job details, and job output panes.
 | Scroll by a page | `PageUp` / `PageDown` | |
 | Go to the beginning or end | `Home`/`End` or `g`/`G` | |
 | Scroll horizontally | `Left`/`Right` or `h`/`l` | `Shift`+wheel |
+| Zoom or restore the focused pane | `z` | |
 | Select output text | | Drag in the output pane |
 | Copy selected output | `y` or `Ctrl-c` | |
 | Copy all output | `Y` | |
