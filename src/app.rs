@@ -74,10 +74,62 @@ struct OutputSelection {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RenderedOutputLine {
+    source_slot: usize,
     source_line: usize,
     start_byte: usize,
     end_byte: usize,
     continuation: bool,
+}
+
+struct FilteredOutputLine {
+    source_line: usize,
+    start_byte: usize,
+    end_byte: usize,
+}
+
+#[derive(Default)]
+struct OutputFilterCache {
+    query: String,
+    lines: Vec<FilteredOutputLine>,
+    content_width: usize,
+}
+
+struct OutputSourceLine<'a> {
+    source_line: usize,
+    text: &'a str,
+}
+
+enum OutputSourceLines<'a> {
+    All(Vec<&'a str>),
+    Filtered {
+        output: &'a str,
+        cache: &'a OutputFilterCache,
+    },
+}
+
+impl<'a> OutputSourceLines<'a> {
+    fn len(&self) -> usize {
+        match self {
+            Self::All(lines) => lines.len(),
+            Self::Filtered { cache, .. } => cache.lines.len(),
+        }
+    }
+
+    fn get(&self, slot: usize) -> OutputSourceLine<'a> {
+        match self {
+            Self::All(lines) => OutputSourceLine {
+                source_line: slot,
+                text: lines[slot],
+            },
+            Self::Filtered { output, cache } => {
+                let line = &cache.lines[slot];
+                OutputSourceLine {
+                    source_line: line.source_line,
+                    text: &output[line.start_byte..line.end_byte],
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -89,7 +141,7 @@ struct OutputRenderOptions<'a> {
     horizontal_offset: usize,
     wrap: bool,
     selection: Option<OutputSelection>,
-    filter: Option<&'a str>,
+    filter_cache: Option<&'a OutputFilterCache>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +175,7 @@ pub struct App {
     job_output_offset: u16,
     job_output_wrap: bool,
     output_filter: Option<String>,
+    output_filter_cache: Option<OutputFilterCache>,
     _job_watcher: JobWatcherHandle,
     job_output_watcher: FileWatcherHandle,
     // sender: Sender<AppMessage>,
@@ -252,6 +305,7 @@ impl App {
             job_output_offset: 0,
             job_output_wrap: false,
             output_filter: None,
+            output_filter_cache: None,
             job_output_watcher: FileWatcherHandle::new(
                 sender.clone(),
                 Duration::from_secs(file_refresh_rate),
@@ -483,6 +537,7 @@ impl App {
                             .max()
                             .unwrap_or_default()
                     });
+                self.rebuild_output_filter_cache();
             }
             AppMessage::Key(key) => {
                 if self.dialog.is_some() {
@@ -582,6 +637,7 @@ impl App {
                     }
                     if let Some(filter) = output_filter_request {
                         self.output_filter = filter;
+                        self.rebuild_output_filter_cache();
                         self.job_output_offset = 0;
                         self.job_output_anchor = ScrollAnchor::Top;
                         self.output_viewport.reset_horizontal();
@@ -602,6 +658,7 @@ impl App {
                         }
                         KeyCode::Esc if self.output_filter.is_some() => {
                             self.output_filter = None;
+                            self.output_filter_cache = None;
                             self.job_output_offset = 0;
                             self.job_output_anchor = ScrollAnchor::Top;
                             self.output_viewport.reset_horizontal();
@@ -1130,17 +1187,10 @@ impl App {
 
         // Log
         let log_area = output_area;
-        let filtered_content_width =
-            self.output_filter
-                .as_deref()
-                .map_or(self.job_output_content_width, |filter| {
-                    output_lines(&self.job_output)
-                        .into_iter()
-                        .filter(|line| line.contains(filter))
-                        .map(display_width)
-                        .max()
-                        .unwrap_or_default()
-                });
+        let filtered_content_width = self
+            .output_filter_cache
+            .as_ref()
+            .map_or(self.job_output_content_width, |cache| cache.content_width);
         let output_content_width = if self.job_output_wrap {
             log_area.width.saturating_sub(2) as usize
         } else {
@@ -1227,7 +1277,7 @@ impl App {
                         horizontal_offset: output_viewport.horizontal_offset(),
                         wrap: self.job_output_wrap,
                         selection: self.output_selection,
-                        filter: self.output_filter.as_deref(),
+                        filter_cache: self.output_filter_cache.as_ref(),
                     },
                 );
                 (text, lines, false)
@@ -1566,7 +1616,10 @@ fn render_output_text(
     output: &str,
     options: OutputRenderOptions,
 ) -> (Text<'static>, Vec<RenderedOutputLine>) {
-    let source_lines = output_lines(output);
+    let source_lines = match options.filter_cache {
+        Some(cache) => OutputSourceLines::Filtered { output, cache },
+        None => OutputSourceLines::All(output_lines(output)),
+    };
     let rendered_lines = visible_output_lines(
         &source_lines,
         options.height,
@@ -1574,20 +1627,20 @@ fn render_output_text(
         options.anchor,
         options.offset,
         options.wrap,
-        options.filter,
     );
     let text = Text::from(
         rendered_lines
             .iter()
             .map(|rendered| {
+                let source = source_lines.get(rendered.source_slot);
                 render_output_line(
-                    source_lines[rendered.source_line],
+                    source.text,
                     *rendered,
                     options.width,
                     options.horizontal_offset,
                     options.wrap,
                     options.selection,
-                    options.filter,
+                    options.filter_cache.map(|cache| cache.query.as_str()),
                 )
             })
             .collect::<Vec<_>>(),
@@ -1599,33 +1652,49 @@ fn output_lines(output: &str) -> Vec<&str> {
     output.lines().flat_map(|line| line.split('\r')).collect()
 }
 
+fn build_output_filter_cache(output: &str, query: &str) -> OutputFilterCache {
+    let output_start = output.as_ptr() as usize;
+    let mut cache = OutputFilterCache {
+        query: query.to_string(),
+        ..OutputFilterCache::default()
+    };
+
+    for (source_line, line) in output_lines(output).into_iter().enumerate() {
+        if !line.contains(query) {
+            continue;
+        }
+        let start_byte = line.as_ptr() as usize - output_start;
+        cache.content_width = cache.content_width.max(display_width(line));
+        cache.lines.push(FilteredOutputLine {
+            source_line,
+            start_byte,
+            end_byte: start_byte + line.len(),
+        });
+    }
+
+    cache
+}
+
 fn visible_output_lines(
-    source_lines: &[&str],
+    source_lines: &OutputSourceLines<'_>,
     height: usize,
     width: usize,
     anchor: ScrollAnchor,
     offset: usize,
     wrap: bool,
-    filter: Option<&str>,
 ) -> Vec<RenderedOutputLine> {
     let mut rendered = Vec::new();
-    let matches_filter =
-        |index: &usize| filter.is_none_or(|filter| source_lines[*index].contains(filter));
     let source_indices: Box<dyn Iterator<Item = usize>> = match anchor {
-        ScrollAnchor::Top => Box::new((0..source_lines.len()).filter(matches_filter).skip(offset)),
-        ScrollAnchor::Bottom => Box::new(
-            (0..source_lines.len())
-                .rev()
-                .filter(matches_filter)
-                .skip(offset),
-        ),
+        ScrollAnchor::Top => Box::new(offset..source_lines.len()),
+        ScrollAnchor::Bottom => Box::new((0..source_lines.len()).rev().skip(offset)),
     };
 
-    for source_line in source_indices {
+    for source_slot in source_indices {
+        let source = source_lines.get(source_slot);
         let mut ranges = if wrap {
-            wrap_byte_ranges(source_lines[source_line], width, width.saturating_sub(2))
+            wrap_byte_ranges(source.text, width, width.saturating_sub(2))
         } else {
-            vec![(0, source_lines[source_line].len())]
+            vec![(0, source.text.len())]
         };
         if matches!(anchor, ScrollAnchor::Bottom) {
             ranges.reverse();
@@ -1639,7 +1708,8 @@ fn visible_output_lines(
                 range_index + 1 < range_count
             };
             rendered.push(RenderedOutputLine {
-                source_line,
+                source_slot,
+                source_line: source.source_line,
                 start_byte,
                 end_byte,
                 continuation,
@@ -1733,11 +1803,11 @@ fn render_output_line(
         source
     };
     let base_byte = if wrap { rendered.start_byte } else { 0 };
-    let match_ranges = filter
+    let mut match_ranges = filter
         .into_iter()
         .flat_map(|filter| source.match_indices(filter))
         .map(|(start, matched)| (start, start + matched.len()))
-        .collect::<Vec<_>>();
+        .peekable();
     for (relative_byte, grapheme) in source_slice.grapheme_indices(true) {
         let start = OutputPoint {
             line: rendered.source_line,
@@ -1749,9 +1819,15 @@ fn render_output_line(
         };
         let selected =
             selection.is_some_and(|selection| start < selection.end && end > selection.start);
-        let matched = match_ranges
-            .iter()
-            .any(|(match_start, match_end)| start.byte < *match_end && end.byte > *match_start);
+        while match_ranges
+            .peek()
+            .is_some_and(|(_, match_end)| *match_end <= start.byte)
+        {
+            match_ranges.next();
+        }
+        let matched = match_ranges.peek().is_some_and(|(match_start, match_end)| {
+            start.byte < *match_end && end.byte > *match_start
+        });
         spans.push(Span::styled(
             grapheme.to_string(),
             if selected {
@@ -1813,6 +1889,13 @@ fn selected_output_text(output: &str, selection: OutputSelection) -> Option<Stri
 }
 
 impl App {
+    fn rebuild_output_filter_cache(&mut self) {
+        self.output_filter_cache = self
+            .output_filter
+            .as_deref()
+            .map(|query| build_output_filter_cache(&self.job_output, query));
+    }
+
     fn clear_output_selection(&mut self) {
         self.output_selection = None;
         self.selection_anchor = None;
@@ -2344,6 +2427,10 @@ mod tests {
         job
     }
 
+    fn test_output_source_lines<'a>(lines: &'a [&'a str]) -> OutputSourceLines<'a> {
+        OutputSourceLines::All(lines.to_vec())
+    }
+
     #[test]
     fn disappeared_jobs_are_remembered_and_can_be_filtered() {
         let previous = vec![test_job("1"), test_job("2")];
@@ -2521,7 +2608,7 @@ mod tests {
                 horizontal_offset: 2,
                 wrap: false,
                 selection: None,
-                filter: None,
+                filter_cache: None,
             },
         );
 
@@ -2541,7 +2628,7 @@ mod tests {
                 horizontal_offset: 0,
                 wrap: false,
                 selection: None,
-                filter: None,
+                filter_cache: None,
             },
         );
 
@@ -2551,8 +2638,10 @@ mod tests {
 
     #[test]
     fn output_filter_keeps_matching_lines_and_highlights_matches() {
+        let output = "info\nfirst error here\nskip\nsecond error\n";
+        let cache = build_output_filter_cache(output, "error");
         let (text, rendered) = render_output_text(
-            "info\nfirst error here\nskip\nsecond error\n",
+            output,
             OutputRenderOptions {
                 height: 10,
                 width: 80,
@@ -2561,7 +2650,7 @@ mod tests {
                 horizontal_offset: 0,
                 wrap: false,
                 selection: None,
-                filter: Some("error"),
+                filter_cache: Some(&cache),
             },
         );
 
@@ -2590,9 +2679,10 @@ mod tests {
     #[test]
     fn visible_lines_map_top_and_bottom_vertical_offsets() {
         let source = ["zero", "one", "two", "three"];
+        let source = test_output_source_lines(&source);
 
-        let top = visible_output_lines(&source, 2, 20, ScrollAnchor::Top, 1, false, None);
-        let bottom = visible_output_lines(&source, 2, 20, ScrollAnchor::Bottom, 1, false, None);
+        let top = visible_output_lines(&source, 2, 20, ScrollAnchor::Top, 1, false);
+        let bottom = visible_output_lines(&source, 2, 20, ScrollAnchor::Bottom, 1, false);
 
         assert_eq!(
             top.iter().map(|line| line.source_line).collect::<Vec<_>>(),
@@ -2610,30 +2700,35 @@ mod tests {
     #[test]
     fn wrapped_lines_retain_source_byte_ranges() {
         let source = ["abcdef"];
-        let lines = visible_output_lines(&source, 4, 3, ScrollAnchor::Top, 0, true, None);
+        let source = test_output_source_lines(&source);
+        let lines = visible_output_lines(&source, 4, 3, ScrollAnchor::Top, 0, true);
 
         assert_eq!(
             lines,
             [
                 RenderedOutputLine {
+                    source_slot: 0,
                     source_line: 0,
                     start_byte: 0,
                     end_byte: 3,
                     continuation: false,
                 },
                 RenderedOutputLine {
+                    source_slot: 0,
                     source_line: 0,
                     start_byte: 3,
                     end_byte: 4,
                     continuation: true,
                 },
                 RenderedOutputLine {
+                    source_slot: 0,
                     source_line: 0,
                     start_byte: 4,
                     end_byte: 5,
                     continuation: true,
                 },
                 RenderedOutputLine {
+                    source_slot: 0,
                     source_line: 0,
                     start_byte: 5,
                     end_byte: 6,
@@ -2687,7 +2782,7 @@ mod tests {
                 horizontal_offset: 2,
                 wrap: false,
                 selection: Some(selection),
-                filter: None,
+                filter_cache: None,
             },
         );
 
