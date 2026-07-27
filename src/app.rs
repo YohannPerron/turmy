@@ -639,7 +639,6 @@ impl App {
                         self.output_filter = filter;
                         self.rebuild_output_filter_cache();
                         self.job_output_offset = 0;
-                        self.job_output_anchor = ScrollAnchor::Top;
                         self.output_viewport.reset_horizontal();
                         self.clear_output_selection();
                     }
@@ -660,7 +659,6 @@ impl App {
                             self.output_filter = None;
                             self.output_filter_cache = None;
                             self.job_output_offset = 0;
-                            self.job_output_anchor = ScrollAnchor::Top;
                             self.output_viewport.reset_horizontal();
                             self.clear_output_selection();
                         }
