@@ -1,6 +1,11 @@
 use crossbeam_channel::{Receiver, TryRecvError, select, unbounded};
 use std::{
-    cmp::min, collections::HashSet, io::Write, path::PathBuf, process::Command, time::Duration,
+    cmp::min,
+    collections::{HashMap, HashSet},
+    io::Write,
+    path::PathBuf,
+    process::Command,
+    time::Duration,
 };
 
 use crate::file_watcher::{FileWatcherError, FileWatcherHandle, FileWatcherUpdate, LogTextDecoder};
@@ -212,6 +217,7 @@ pub struct Job {
     pub time: String,
     pub time_limit: String,
     pub start_time: String,
+    pub start_time_stale: bool,
     pub tres: String,
     pub partition: String,
     pub nodelist: String,
@@ -1087,7 +1093,7 @@ impl App {
                 if j.state == "PENDING" {
                     state_spans.extend([
                         Span::styled(" Start ", Style::default().fg(Color::Yellow)),
-                        Span::raw(&j.start_time),
+                        Span::styled(&j.start_time, start_time_style(j.start_time_stale)),
                     ]);
                 }
                 if let Some(s) = j.reason.as_deref() {
@@ -1478,6 +1484,14 @@ fn pane_border_style(focused: Pane, pane: Pane, dialog_open: bool) -> Style {
     }
 }
 
+fn start_time_style(stale: bool) -> Style {
+    if stale {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+    }
+}
+
 fn pane_areas(area: Rect, maximized_pane: Option<Pane>) -> (Rect, Rect, Rect) {
     match maximized_pane {
         Some(Pane::Jobs) => (area, Rect::default(), Rect::default()),
@@ -1499,8 +1513,26 @@ fn pane_areas(area: Rect, maximized_pane: Option<Pane>) -> (Rect, Rect, Rect) {
 }
 
 fn remember_finished_jobs(previous: Vec<Job>, mut current: Vec<Job>) -> Vec<Job> {
-    for job in &mut current {
-        job.finished = false;
+    {
+        let previous_by_id = previous
+            .iter()
+            .map(|job| (job.id(), job))
+            .collect::<HashMap<_, _>>();
+
+        for job in &mut current {
+            job.finished = false;
+            job.start_time_stale = false;
+
+            if job.state == "PENDING"
+                && job.start_time == "N/A"
+                && let Some(previous_job) = previous_by_id
+                    .get(&job.id())
+                    .filter(|previous_job| previous_job.start_time != "N/A")
+            {
+                job.start_time.clone_from(&previous_job.start_time);
+                job.start_time_stale = true;
+            }
+        }
     }
     let current_ids = current.iter().map(Job::id).collect::<HashSet<_>>();
     let current_array_ids = current
@@ -2403,6 +2435,7 @@ mod tests {
             time: "00:01".to_string(),
             time_limit: "01:00:00".to_string(),
             start_time: "N/A".to_string(),
+            start_time_stale: false,
             tres: "cpu=1".to_string(),
             partition: "debug".to_string(),
             nodelist: "node01".to_string(),
@@ -2475,6 +2508,65 @@ mod tests {
         assert_eq!(remembered[0].state, "RUNNING");
         assert_eq!(remembered[0].time, "00:03");
         assert!(!remembered[0].finished);
+    }
+
+    #[test]
+    fn pending_job_remembers_start_time_when_slurm_reports_na() {
+        let mut previous = test_job("1");
+        previous.state = "PENDING".to_string();
+        previous.state_compact = "PD".to_string();
+        previous.start_time = "2026-07-30T14:00:00".to_string();
+
+        let mut refreshed = previous.clone();
+        refreshed.start_time = "N/A".to_string();
+
+        let remembered = remember_finished_jobs(vec![previous], vec![refreshed]);
+
+        assert_eq!(remembered[0].start_time, "2026-07-30T14:00:00");
+        assert!(remembered[0].start_time_stale);
+    }
+
+    #[test]
+    fn refreshed_start_time_replaces_stale_value() {
+        let mut previous = test_job("1");
+        previous.state = "PENDING".to_string();
+        previous.state_compact = "PD".to_string();
+        previous.start_time = "2026-07-30T14:00:00".to_string();
+        previous.start_time_stale = true;
+
+        let mut refreshed = previous.clone();
+        refreshed.start_time = "2026-07-30T14:15:00".to_string();
+
+        let remembered = remember_finished_jobs(vec![previous], vec![refreshed]);
+
+        assert_eq!(remembered[0].start_time, "2026-07-30T14:15:00");
+        assert!(!remembered[0].start_time_stale);
+    }
+
+    #[test]
+    fn stale_start_time_survives_repeated_na_updates() {
+        let mut previous = test_job("1");
+        previous.state = "PENDING".to_string();
+        previous.state_compact = "PD".to_string();
+        previous.start_time = "2026-07-30T14:00:00".to_string();
+
+        let mut refreshed = previous.clone();
+        refreshed.start_time = "N/A".to_string();
+        let remembered = remember_finished_jobs(vec![previous], vec![refreshed]);
+
+        let mut refreshed_again = remembered[0].clone();
+        refreshed_again.start_time = "N/A".to_string();
+        refreshed_again.start_time_stale = false;
+        let remembered = remember_finished_jobs(remembered, vec![refreshed_again]);
+
+        assert_eq!(remembered[0].start_time, "2026-07-30T14:00:00");
+        assert!(remembered[0].start_time_stale);
+    }
+
+    #[test]
+    fn stale_start_time_uses_old_value_color() {
+        assert_eq!(start_time_style(true).fg, Some(Color::DarkGray));
+        assert_eq!(start_time_style(false).fg, None);
     }
 
     #[test]

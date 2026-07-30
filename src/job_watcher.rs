@@ -104,6 +104,7 @@ impl JobWatcher {
             time: time.to_owned(),
             time_limit: time_limit.to_owned(),
             start_time: start_time.to_owned(),
+            start_time_stale: false,
             tres: tres.to_owned(),
             partition: partition.to_owned(),
             nodelist: nodelist.to_owned(),
