@@ -1,6 +1,8 @@
 mod app;
 mod file_watcher;
+mod job_list;
 mod job_watcher;
+mod panel_size;
 mod squeue_args;
 mod updater;
 mod viewport;
@@ -20,6 +22,8 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use job_list::JobColumn;
+use panel_size::PanelSize;
 use ratatui::{
     Terminal,
     backend::{Backend, CrosstermBackend},
@@ -36,12 +40,52 @@ struct Cli {
     update: bool,
 
     /// Refresh rate for the job watcher.
-    #[arg(long, value_name = "SECONDS", default_value_t = 2)]
+    #[arg(
+        long,
+        env = "TURMY_SLURM_REFRESH",
+        value_name = "SECONDS",
+        default_value_t = 2
+    )]
     slurm_refresh: u64,
 
     /// Refresh rate for the file watcher.
-    #[arg(long, value_name = "SECONDS", default_value_t = 2)]
+    #[arg(
+        long,
+        env = "TURMY_FILE_REFRESH",
+        value_name = "SECONDS",
+        default_value_t = 2
+    )]
     file_refresh: u64,
+
+    /// Initial Jobs pane width: content columns (excluding borders) or a percentage (0 hides it).
+    #[arg(
+        long,
+        env = "TURMY_JOBS_WIDTH",
+        value_name = "COLS|PERCENT%",
+        default_value = "33%"
+    )]
+    jobs_width: PanelSize,
+
+    /// Jobs list columns in display order, separated by commas.
+    #[arg(
+        long,
+        env = "TURMY_JOBS_COLUMNS",
+        value_name = "COLUMNS",
+        value_delimiter = ',',
+        value_enum,
+        default_value = "state,id,partition,user,time,name"
+    )]
+    jobs_columns: Vec<JobColumn>,
+
+    /// Initial Details pane height in content lines, excluding borders (0-6, 0 hides it).
+    #[arg(
+        long,
+        env = "TURMY_DETAILS_HEIGHT",
+        value_name = "LINES",
+        default_value_t = app::MAX_DETAILS_LINES,
+        value_parser = clap::value_parser!(u16).range(0..=i64::from(app::MAX_DETAILS_LINES))
+    )]
+    details_height: u16,
 
     /// squeue arguments
     #[command(flatten)]
@@ -146,6 +190,9 @@ fn run_app<B: Backend<Error = io::Error> + Write>(
         args.slurm_refresh,
         args.file_refresh,
         args.squeue_args.to_vec(),
+        args.jobs_width,
+        args.details_height,
+        args.jobs_columns,
     );
     thread::spawn(move || input_loop(input_tx));
     app.run(terminal)

@@ -139,6 +139,24 @@ settings may block or limit it. A “Copied” status means `turmy` successfully
 the copy request to the terminal; OSC 52 does not provide confirmation that the
 desktop clipboard accepted it.
 
+## Configuration
+
+| CLI flag | Environment variable | Default |
+| --- | --- | --- |
+| `--jobs-columns` | `TURMY_JOBS_COLUMNS` | `state,id,partition,user,time,name` |
+| `--jobs-width` | `TURMY_JOBS_WIDTH` | `33%` |
+| `--details-height` | `TURMY_DETAILS_HEIGHT` | 6 content lines |
+| `--slurm-refresh` | `TURMY_SLURM_REFRESH` | 2 seconds |
+| `--file-refresh` | `TURMY_FILE_REFRESH` | 2 seconds |
+
+List job columns in display order, separated by commas. For example,
+`turmy --jobs-columns id,name,state` shows those three fields.
+
+Set the Jobs width as a percentage or a number of content columns. Set the
+Details height in content lines from 0 to 6. A size of zero hides that pane.
+Drag the border between panes to resize them, or double-click it to restore the
+startup size. To reopen a collapsed pane, drag its border inward from the edge.
+
 ## How it works
 
 `turmy` obtains information about jobs by parsing the output of `squeue`.

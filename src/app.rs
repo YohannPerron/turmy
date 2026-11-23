@@ -5,16 +5,18 @@ use std::{
     io::Write,
     path::PathBuf,
     process::Command,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::file_watcher::{FileWatcherError, FileWatcherHandle, FileWatcherUpdate, LogTextDecoder};
+use crate::job_list::{JobColumn, job_lines};
 use crate::job_watcher::JobWatcherHandle;
+use crate::panel_size::PanelSize;
 use crate::viewport::{Pane, PaneViewport, clip_line, display_width};
 
 use crossterm::{
     clipboard::CopyToClipboard,
-    event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind},
+    event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
     execute,
 };
 use ratatui::{
@@ -168,6 +170,10 @@ struct CopyFeedback {
 pub struct App {
     focus: Pane,
     maximized_pane: Option<Pane>,
+    panel_split: PanelSplit,
+    details_split: DetailsSplit,
+    content_area: Rect,
+    job_columns: Vec<JobColumn>,
     dialog: Option<Dialog>,
     remembered_jobs: Vec<Job>,
     jobs: Vec<Job>,
@@ -228,7 +234,7 @@ pub struct Job {
 }
 
 impl Job {
-    fn id(&self) -> String {
+    pub(crate) fn id(&self) -> String {
         if self.job_id.contains("_[") {
             return self.job_id.clone();
         }
@@ -281,6 +287,9 @@ pub(crate) enum MouseWheelDirection {
 
 const SCANCEL_SIGNALS: &[&str] = &["TERM", "INT", "HUP", "USR1", "USR2", "STOP", "CONT", "KILL"];
 const DIALOG_WIDTH: u16 = 80;
+const MIN_PANEL_SIZE: u16 = 3;
+pub(crate) const MAX_DETAILS_LINES: u16 = 6;
+const MAX_DETAILS_HEIGHT: u16 = MAX_DETAILS_LINES + 2;
 const SHIFT_WHEEL_SCROLL_MULTIPLIER: u16 = 3;
 
 impl App {
@@ -289,11 +298,28 @@ impl App {
         slurm_refresh_rate: u64,
         file_refresh_rate: u64,
         squeue_args: Vec<String>,
+        jobs_width: PanelSize,
+        details_height: u16,
+        job_columns: Vec<JobColumn>,
     ) -> App {
         let (sender, receiver) = unbounded();
         Self {
             focus: Pane::Jobs,
             maximized_pane: None,
+            panel_split: PanelSplit {
+                initial_width: Some(jobs_width),
+                ..PanelSplit::default()
+            },
+            details_split: DetailsSplit {
+                initial_height: Some(if details_height == 0 {
+                    0
+                } else {
+                    details_height + 2
+                }),
+                ..DetailsSplit::default()
+            },
+            content_area: Rect::default(),
+            job_columns,
             dialog: None,
             remembered_jobs: Vec::new(),
             jobs: Vec::new(),
@@ -396,9 +422,22 @@ impl App {
                     return (true, false);
                 }
                 self.handle(AppMessage::Key(key));
+                if self.dialog.is_some() || self.maximized_pane.is_some() {
+                    self.panel_split.drag = None;
+                    self.panel_split.last_click = None;
+                    self.details_split.drag = None;
+                    self.details_split.last_click = None;
+                }
                 (false, true)
             }
             Event::Paste(_) => (false, false),
+            Event::Mouse(mouse)
+                if self.dialog.is_none()
+                    && self.maximized_pane.is_none()
+                    && self.handle_split_mouse(mouse) =>
+            {
+                (false, true)
+            }
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     if self.dialog.is_some() {
@@ -496,6 +535,20 @@ impl App {
             },
             Event::Resize(_, _) => (false, true),
             _ => (false, false),
+        }
+    }
+
+    fn handle_split_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let [jobs, right] = self.panel_split.areas(self.content_area);
+        if self.details_split.drag.is_none()
+            && self
+                .panel_split
+                .handle_mouse(mouse, jobs, self.content_area)
+        {
+            self.details_split.last_click = None;
+            true
+        } else {
+            self.details_split.handle_mouse(mouse, right)
         }
     }
 
@@ -685,8 +738,8 @@ impl App {
                             self.show_finished_jobs = !self.show_finished_jobs;
                             self.rebuild_visible_jobs();
                         }
-                        KeyCode::Tab => self.focus_next_panel(),
-                        KeyCode::BackTab => self.focus_previous_panel(),
+                        KeyCode::Tab => self.cycle_focus(Pane::next),
+                        KeyCode::BackTab => self.cycle_focus(Pane::previous),
                         KeyCode::Char('h') | KeyCode::Left => {
                             self.scroll_focused_horizontal_left(horizontal_scroll_amount(key))
                         }
@@ -939,8 +992,25 @@ impl App {
             .constraints([Constraint::Min(3), Constraint::Length(1)].as_ref())
             .split(f.area());
 
-        let (jobs_area, details_area, output_area) =
-            pane_areas(content_help[0], self.maximized_pane);
+        self.content_area = content_help[0];
+        let (jobs_area, details_area, output_area) = pane_areas(
+            self.content_area,
+            self.maximized_pane,
+            &self.panel_split,
+            &self.details_split,
+        );
+        let pane_areas = [
+            (Pane::Jobs, jobs_area),
+            (Pane::Details, details_area),
+            (Pane::Output, output_area),
+        ];
+        if pane_areas
+            .iter()
+            .any(|(pane, area)| *pane == self.focus && area.is_empty())
+            && let Some((pane, _)) = pane_areas.iter().find(|(_, area)| !area.is_empty())
+        {
+            self.focus = *pane;
+        }
 
         // Help
         let help_options = [
@@ -971,64 +1041,7 @@ impl App {
         f.render_widget(help, content_help[1]);
 
         // Jobs
-        let max_id_len = self.jobs.iter().map(|j| j.id().len()).max().unwrap_or(0);
-        let max_user_len = self.jobs.iter().map(|j| j.user.len()).max().unwrap_or(0);
-        let max_partition_len = self
-            .jobs
-            .iter()
-            .map(|j| j.partition.len())
-            .max()
-            .unwrap_or(0);
-        let max_time_len = self.jobs.iter().map(|j| j.time.len()).max().unwrap_or(0);
-        let max_state_compact_len = self
-            .jobs
-            .iter()
-            .map(|j| j.state_compact.len())
-            .max()
-            .unwrap_or(0);
-        let job_lines: Vec<Line> = self
-            .jobs
-            .iter()
-            .map(|j| {
-                let line = Line::from(vec![
-                    Span::styled(
-                        format!(
-                            "{:<max$.max$}",
-                            j.state_compact,
-                            max = max_state_compact_len
-                        ),
-                        Style::default(),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(
-                        format!("{:<max$.max$}", j.id(), max = max_id_len),
-                        Style::default().fg(Color::Yellow),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(
-                        format!("{:<max$.max$}", j.partition, max = max_partition_len),
-                        Style::default().fg(Color::Blue),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(
-                        format!("{:<max$.max$}", j.user, max = max_user_len),
-                        Style::default().fg(Color::Green),
-                    ),
-                    Span::raw(" "),
-                    Span::styled(
-                        format!("{:>max$.max$}", j.time, max = max_time_len),
-                        Style::default().fg(Color::Red),
-                    ),
-                    Span::raw(" "),
-                    Span::raw(&j.name),
-                ]);
-                if j.finished {
-                    line.style(Style::default().add_modifier(Modifier::DIM))
-                } else {
-                    line
-                }
-            })
-            .collect();
+        let job_lines = job_lines(&self.jobs, &self.job_columns);
         let jobs_content_width = job_lines.iter().map(Line::width).max().unwrap_or_default();
         self.jobs_viewport.update(jobs_area, jobs_content_width);
         let jobs_viewport = self.jobs_viewport;
@@ -1324,6 +1337,8 @@ impl App {
                         Line::default(),
                         Line::from("Mouse"),
                         Line::from("  Click                  Focus a pane or select a job"),
+                        Line::from("  Drag pane border       Resize panes"),
+                        Line::from("  Double-click border    Reset pane size"),
                         Line::from("  Drag in output         Select text"),
                         Line::from("  Wheel / Shift-wheel    Vertical / horizontal scroll"),
                         Line::default(),
@@ -1334,7 +1349,7 @@ impl App {
                         f,
                         "Help",
                         Color::Green,
-                        24,
+                        26,
                         content,
                         Some(Wrap { trim: false }),
                     );
@@ -1492,24 +1507,209 @@ fn start_time_style(stale: bool) -> Style {
     }
 }
 
-fn pane_areas(area: Rect, maximized_pane: Option<Pane>) -> (Rect, Rect, Rect) {
+fn pane_areas(
+    area: Rect,
+    maximized_pane: Option<Pane>,
+    panel_split: &PanelSplit,
+    details_split: &DetailsSplit,
+) -> (Rect, Rect, Rect) {
     match maximized_pane {
         Some(Pane::Jobs) => (area, Rect::default(), Rect::default()),
         Some(Pane::Details) => (Rect::default(), area, Rect::default()),
         Some(Pane::Output) => (Rect::default(), Rect::default(), area),
         None => {
-            let master_detail = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(50), Constraint::Percentage(70)].as_ref())
-                .split(area);
-            let job_detail_log = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(8), Constraint::Min(3)].as_ref())
-                .split(master_detail[1]);
-
-            (master_detail[0], job_detail_log[0], job_detail_log[1])
+            let [jobs, right] = panel_split.areas(area);
+            let [details, output] = details_split.areas(right);
+            (jobs, details, output)
         }
     }
+}
+
+#[derive(Default)]
+struct PanelSplit {
+    initial_width: Option<PanelSize>,
+    width: Option<PanelSize>,
+    drag: Option<PanelDrag>,
+    last_click: Option<(Instant, u16, u16)>,
+}
+
+struct PanelDrag {
+    column: u16,
+    width: u16,
+}
+
+impl PanelSplit {
+    fn areas(&self, area: Rect) -> [Rect; 2] {
+        let [jobs_width, output_width] = panel_sizes(
+            self.width
+                .or(self.initial_width)
+                .unwrap_or(PanelSize::Ratio(33, 100))
+                .outer_size(area.width),
+            area.width,
+            area.width,
+        );
+        [
+            Rect::new(area.x, area.y, jobs_width, area.height),
+            Rect::new(area.x + jobs_width, area.y, output_width, area.height),
+        ]
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent, jobs: Rect, content: Rect) -> bool {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.drag = None;
+                let last_click = self.last_click.take();
+                if !rect_contains(content, mouse.column, mouse.row)
+                    || mouse.column < jobs.right().saturating_sub(1)
+                    || mouse.column > jobs.right()
+                {
+                    return false;
+                }
+                if last_click.is_some_and(|(time, column, row)| {
+                    time.elapsed() <= Duration::from_millis(400)
+                        && column.abs_diff(mouse.column) <= 1
+                        && row == mouse.row
+                }) {
+                    self.width = None;
+                    return true;
+                }
+                self.last_click = Some((Instant::now(), mouse.column, mouse.row));
+                self.drag = Some(PanelDrag {
+                    column: mouse.column,
+                    width: jobs.width,
+                });
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.last_click = None;
+                let Some(drag) = &self.drag else {
+                    return false;
+                };
+                let delta = i32::from(mouse.column) - i32::from(drag.column);
+                if delta == 0 && jobs.width == drag.width {
+                    return false;
+                }
+                let width = if mouse.column <= content.x {
+                    0
+                } else if mouse.column >= content.right() - 1 {
+                    content.width
+                } else {
+                    (i32::from(drag.width) + delta).clamp(0, i32::from(content.width)) as u16
+                };
+                let width = panel_sizes(width, content.width, content.width)[0];
+                self.width = Some(
+                    self.initial_width
+                        .unwrap_or(PanelSize::Ratio(33, 100))
+                        .resized(width, content.width),
+                );
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.drag.take().is_some(),
+            MouseEventKind::Down(_) => {
+                self.last_click = None;
+                false
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Default)]
+struct DetailsSplit {
+    initial_height: Option<u16>,
+    height: Option<u16>,
+    prioritize_details: bool,
+    drag: Option<(u16, u16)>,
+    last_click: Option<(Instant, u16, u16)>,
+}
+
+impl DetailsSplit {
+    fn areas(&self, area: Rect) -> [Rect; 2] {
+        let height = self
+            .height
+            .or(self.initial_height)
+            .unwrap_or(MAX_DETAILS_HEIGHT)
+            .min(if self.prioritize_details {
+                area.height
+            } else {
+                area.height.saturating_sub(MIN_PANEL_SIZE)
+            });
+        let [height, output_height] = panel_sizes(height, area.height, MAX_DETAILS_HEIGHT);
+        [
+            Rect::new(area.x, area.y, area.width, height),
+            Rect::new(area.x, area.y + height, area.width, output_height),
+        ]
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> bool {
+        let details = self.areas(area)[0];
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.drag = None;
+                let last_click = self.last_click.take();
+                if !rect_contains(area, mouse.column, mouse.row)
+                    || mouse.row < details.bottom().saturating_sub(1)
+                    || mouse.row > details.bottom()
+                {
+                    return false;
+                }
+                if last_click.is_some_and(|(time, column, row)| {
+                    time.elapsed() <= Duration::from_millis(400)
+                        && column == mouse.column
+                        && row.abs_diff(mouse.row) <= 1
+                }) {
+                    self.height = None;
+                    self.prioritize_details = false;
+                    return true;
+                }
+                self.last_click = Some((Instant::now(), mouse.column, mouse.row));
+                self.drag = Some((mouse.row, details.height));
+                true
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                self.last_click = None;
+                let Some((row, height)) = self.drag else {
+                    return false;
+                };
+                let height = if mouse.row >= area.bottom() - 1 {
+                    area.height
+                } else {
+                    (i32::from(height) + i32::from(mouse.row) - i32::from(row))
+                        .clamp(0, i32::from(area.height)) as u16
+                };
+                let [height, output_height] = panel_sizes(height, area.height, MAX_DETAILS_HEIGHT);
+                self.height = Some(height);
+                self.prioritize_details = output_height == 0 && height > 0;
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.drag.take().is_some(),
+            MouseEventKind::Down(_) => {
+                self.last_click = None;
+                false
+            }
+            _ => false,
+        }
+    }
+}
+
+fn panel_sizes(size: u16, total: u16, max: u16) -> [u16; 2] {
+    let size = size.min(total).min(max);
+    let size = if size < MIN_PANEL_SIZE {
+        0
+    } else if total - size < MIN_PANEL_SIZE {
+        total.min(max)
+    } else {
+        size
+    };
+    let remainder = total - size;
+    [
+        size,
+        if remainder < MIN_PANEL_SIZE {
+            0
+        } else {
+            remainder
+        },
+    ]
 }
 
 fn remember_finished_jobs(previous: Vec<Job>, mut current: Vec<Job>) -> Vec<Job> {
@@ -2112,17 +2312,23 @@ impl App {
         }
     }
 
-    fn focus_next_panel(&mut self) {
-        self.focus = self.focus.next();
+    fn cycle_focus(&mut self, advance: fn(Pane) -> Pane) {
+        let next = advance(self.focus);
         if self.maximized_pane.is_some() {
-            self.maximized_pane = Some(self.focus);
-        }
-    }
-
-    fn focus_previous_panel(&mut self) {
-        self.focus = self.focus.previous();
-        if self.maximized_pane.is_some() {
-            self.maximized_pane = Some(self.focus);
+            self.focus = next;
+            self.maximized_pane = Some(next);
+        } else {
+            self.focus = [next, advance(next)]
+                .into_iter()
+                .find(|pane| {
+                    let viewport = match pane {
+                        Pane::Jobs => self.jobs_viewport,
+                        Pane::Details => self.details_viewport,
+                        Pane::Output => self.output_viewport,
+                    };
+                    !viewport.area().is_empty()
+                })
+                .unwrap_or(self.focus);
         }
     }
 
@@ -2617,14 +2823,81 @@ mod tests {
         let area = Rect::new(2, 3, 100, 40);
 
         assert_eq!(
-            pane_areas(area, Some(Pane::Details)),
+            pane_areas(
+                area,
+                Some(Pane::Details),
+                &PanelSplit::default(),
+                &DetailsSplit::default()
+            ),
             (Rect::default(), area, Rect::default())
         );
 
-        let (jobs, details, output) = pane_areas(area, None);
+        let (jobs, details, output) =
+            pane_areas(area, None, &PanelSplit::default(), &DetailsSplit::default());
         assert!(jobs.width > 0);
         assert!(details.height > 0);
         assert!(output.height > 0);
+    }
+
+    #[test]
+    fn pane_borders_drag_collapse_and_reset_to_configured_sizes() {
+        let area = Rect::new(0, 0, 100, 29);
+        let mut jobs = PanelSplit {
+            initial_width: Some(PanelSize::Content(30)),
+            ..PanelSplit::default()
+        };
+        let mut details = DetailsSplit {
+            initial_height: Some(6),
+            ..DetailsSplit::default()
+        };
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        let up = MouseEventKind::Up(MouseButton::Left);
+
+        for (kind, x) in [(down, 32), (drag, 48), (up, 48)] {
+            assert!(jobs.handle_mouse(mouse(kind, x, 10), jobs.areas(area)[0], area));
+        }
+        assert_eq!(jobs.areas(area)[0].width, 48);
+        assert_eq!(jobs.areas(Rect::new(0, 0, 120, 29))[0].width, 48);
+        for kind in [down, up, down] {
+            assert!(jobs.handle_mouse(mouse(kind, 48, 10), jobs.areas(area)[0], area));
+        }
+        assert_eq!(jobs.areas(area)[0].width, 32);
+
+        let right = jobs.areas(area)[1];
+        for (kind, y) in [(down, 6), (drag, 0), (up, 0)] {
+            assert!(details.handle_mouse(mouse(kind, 60, y), right));
+        }
+        let [hidden, output] = details.areas(right);
+        assert!(hidden.is_empty());
+        assert_eq!(output, right);
+        for kind in [down, up, down] {
+            assert!(details.handle_mouse(mouse(kind, 60, 0), right));
+        }
+        assert_eq!(details.areas(right)[0].height, 6);
+    }
+
+    #[test]
+    fn job_columns_keep_unicode_alignment_and_fused_array_ids() {
+        let mut array = test_array_job("42", 1, "PENDING");
+        array.array_step = Some("1-3".into());
+        array.array_task_count = 3;
+        array.name = "界".into();
+        let mut finished = test_job("7");
+        finished.name = "abc".into();
+        finished.finished = true;
+
+        let jobs = [array, finished];
+        let rows = job_lines(&jobs, &[JobColumn::Name, JobColumn::Id]);
+        assert_eq!(rows[0].to_string(), "界  42_[1-3]");
+        assert_eq!(rows[1].to_string(), "abc 7");
+        assert!(rows[1].style.add_modifier.contains(Modifier::DIM));
     }
 
     #[test]
