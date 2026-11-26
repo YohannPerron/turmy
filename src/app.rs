@@ -577,6 +577,9 @@ impl App {
                         self.job_output.clear();
                         self.job_output_error = None;
                         self.job_output_decoder.reset();
+                        self.job_output_anchor = ScrollAnchor::Bottom;
+                        self.job_output_offset = 0;
+                        self.output_viewport.reset_horizontal();
                         self.clear_output_selection();
                     }
                     FileWatcherUpdate::Append(bytes) => {
@@ -1218,6 +1221,53 @@ impl App {
             self.output_viewport.reset_horizontal();
         }
         let output_viewport = self.output_viewport;
+        let log_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(pane_border_style(
+                self.focus,
+                Pane::Output,
+                self.dialog.is_some(),
+            ));
+        let log_inner = log_block.inner(log_area);
+        self.output_inner_area = log_inner;
+        self.job_output_height = log_inner.height;
+
+        let (log_text, rendered_output_lines, log_error) = match &self.job_output_error {
+            None if self.job_output.is_empty() => {
+                let message = match self.selected_job() {
+                    None => "Select a job to view its output.",
+                    Some(job) if job.is_aggregated_array() => {
+                        "Select an individual array task to view its output."
+                    }
+                    Some(_) => "No output yet.",
+                };
+                (
+                    Text::styled(message, Style::default().add_modifier(Modifier::DIM)),
+                    Vec::new(),
+                    false,
+                )
+            }
+            None => {
+                let (text, lines, offset) = render_output_text(
+                    &self.job_output,
+                    OutputRenderOptions {
+                        height: log_inner.height as usize,
+                        width: log_inner.width as usize,
+                        anchor: self.job_output_anchor,
+                        offset: self.job_output_offset as usize,
+                        horizontal_offset: output_viewport.horizontal_offset(),
+                        wrap: self.job_output_wrap,
+                        selection: self.output_selection,
+                        filter_cache: self.output_filter_cache.as_ref(),
+                    },
+                );
+                self.job_output_offset = offset as u16;
+                (text, lines, false)
+            }
+            Some(error) => (Text::from(error.to_string()), Vec::new(), true),
+        };
+        self.rendered_output_lines = rendered_output_lines;
         let mut log_title_spans = vec![
             Span::raw("─"),
             Span::raw(match self.output_file_view {
@@ -1257,52 +1307,7 @@ impl App {
             ));
         }
         let log_title = Line::from(log_title_spans);
-        let log_block = Block::default()
-            .title(log_title)
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(pane_border_style(
-                self.focus,
-                Pane::Output,
-                self.dialog.is_some(),
-            ));
-        let log_inner = log_block.inner(log_area);
-        self.output_inner_area = log_inner;
-        self.job_output_height = log_inner.height;
-
-        // let job_log = self.job_stdout.as_deref().map(|s| {
-        //     string_for_paragraph(
-        //         s,
-        //         log_block.inner(log_area).height as usize,
-        //         log_block.inner(log_area).width as usize,
-        //         self.job_stdout_offset as usize,
-        //     )
-        // }).unwrap_or_else(|e| {
-        //     self.job_stdout_offset = 0;
-        //     "".to_string()
-        // });
-
-        let (log_text, rendered_output_lines, log_error) = match &self.job_output_error {
-            None => {
-                let (text, lines) = render_output_text(
-                    &self.job_output,
-                    OutputRenderOptions {
-                        height: log_inner.height as usize,
-                        width: log_inner.width as usize,
-                        anchor: self.job_output_anchor,
-                        offset: self.job_output_offset as usize,
-                        horizontal_offset: output_viewport.horizontal_offset(),
-                        wrap: self.job_output_wrap,
-                        selection: self.output_selection,
-                        filter_cache: self.output_filter_cache.as_ref(),
-                    },
-                );
-                (text, lines, false)
-            }
-            Some(error) => (Text::from(error.to_string()), Vec::new(), true),
-        };
-        self.rendered_output_lines = rendered_output_lines;
-        let mut log = Paragraph::new(log_text).block(log_block);
+        let mut log = Paragraph::new(log_text).block(log_block.title(log_title));
         if log_error {
             log = log
                 .style(Style::default().fg(Color::Red))
@@ -1589,14 +1594,21 @@ impl PanelSplit {
                 if delta == 0 && jobs.width == drag.width {
                     return false;
                 }
+                // Keep room for output when resizing with the mouse. Zoom can use the full screen.
+                let max_width = content.width
+                    - content
+                        .width
+                        .div_ceil(3)
+                        .max(MIN_PANEL_SIZE)
+                        .min(content.width);
+                // Preserve a smooth drag if the configured starting width already exceeds the cap.
+                let max_width = max_width.max(drag.width.min(content.width));
                 let width = if mouse.column <= content.x {
                     0
-                } else if mouse.column >= content.right() - 1 {
-                    content.width
                 } else {
-                    (i32::from(drag.width) + delta).clamp(0, i32::from(content.width)) as u16
+                    (i32::from(drag.width) + delta).clamp(0, i32::from(max_width)) as u16
                 };
-                let width = panel_sizes(width, content.width, content.width)[0];
+                let width = panel_sizes(width, content.width, max_width)[0];
                 self.width = Some(
                     self.initial_width
                         .unwrap_or(PanelSize::Ratio(33, 100))
@@ -1845,17 +1857,18 @@ fn render_dialog(
 fn render_output_text(
     output: &str,
     options: OutputRenderOptions,
-) -> (Text<'static>, Vec<RenderedOutputLine>) {
+) -> (Text<'static>, Vec<RenderedOutputLine>, usize) {
     let source_lines = match options.filter_cache {
         Some(cache) => OutputSourceLines::Filtered { output, cache },
         None => OutputSourceLines::All(output_lines(output)),
     };
+    let offset = options.offset.min(source_lines.len().saturating_sub(1));
     let rendered_lines = visible_output_lines(
         &source_lines,
         options.height,
         options.width,
         options.anchor,
-        options.offset,
+        offset,
         options.wrap,
     );
     let text = Text::from(
@@ -1875,7 +1888,7 @@ fn render_output_text(
             })
             .collect::<Vec<_>>(),
     );
-    (text, rendered_lines)
+    (text, rendered_lines, offset)
 }
 
 fn output_lines(output: &str) -> Vec<&str> {
@@ -2884,6 +2897,86 @@ mod tests {
     }
 
     #[test]
+    fn dragging_jobs_border_reserves_room_for_output() {
+        let area = Rect::new(0, 0, 100, 24);
+        let mut split = PanelSplit::default();
+        for (kind, column) in [
+            (MouseEventKind::Down(MouseButton::Left), 33),
+            (MouseEventKind::Drag(MouseButton::Left), 99),
+        ] {
+            assert!(split.handle_mouse(
+                MouseEvent {
+                    kind,
+                    column,
+                    row: 5,
+                    modifiers: KeyModifiers::NONE
+                },
+                split.areas(area)[0],
+                area,
+            ));
+        }
+        assert_eq!(split.areas(area)[1].width, 34);
+    }
+
+    #[test]
+    fn dragging_a_wide_configured_jobs_pane_does_not_jump() {
+        let area = Rect::new(0, 0, 100, 24);
+        let mut split = PanelSplit {
+            initial_width: Some(PanelSize::Ratio(80, 100)),
+            ..PanelSplit::default()
+        };
+        for (kind, column, expected_width) in [
+            (MouseEventKind::Down(MouseButton::Left), 80, 80),
+            (MouseEventKind::Drag(MouseButton::Left), 81, 80),
+            (MouseEventKind::Drag(MouseButton::Left), 79, 79),
+        ] {
+            assert!(split.handle_mouse(
+                MouseEvent {
+                    kind,
+                    column,
+                    row: 5,
+                    modifiers: KeyModifiers::NONE
+                },
+                split.areas(area)[0],
+                area,
+            ));
+            assert_eq!(split.areas(area)[0].width, expected_width);
+        }
+    }
+
+    #[test]
+    fn long_job_fields_do_not_push_following_columns_out() {
+        let mut job = test_job("7");
+        job.partition = format!("{}  ", "界".repeat(15));
+        job.user = "alice   ".into();
+        let jobs = [job];
+        let rows = job_lines(&jobs, &[JobColumn::Partition, JobColumn::User]);
+        assert_eq!(rows[0].to_string(), "界界界界界…  alice");
+        assert_eq!(rows[0].spans[0].width(), 12);
+    }
+
+    #[test]
+    fn scrolling_past_the_end_keeps_output_visible() {
+        for (anchor, expected) in [(ScrollAnchor::Top, "last"), (ScrollAnchor::Bottom, "first")] {
+            let (text, _, offset) = render_output_text(
+                "first\nlast",
+                OutputRenderOptions {
+                    height: 4,
+                    width: 20,
+                    anchor,
+                    offset: 100,
+                    horizontal_offset: 0,
+                    wrap: false,
+                    selection: None,
+                    filter_cache: None,
+                },
+            );
+            assert_eq!(offset, 1);
+            assert_eq!(text.lines[0].to_string(), expected);
+        }
+    }
+
+    #[test]
     fn job_columns_keep_unicode_alignment_and_fused_array_ids() {
         let mut array = test_array_job("42", 1, "PENDING");
         array.array_step = Some("1-3".into());
@@ -2961,7 +3054,7 @@ mod tests {
 
     #[test]
     fn test_fit_text_applies_horizontal_offset_without_wrapping() {
-        let (text, _) = render_output_text(
+        let (text, _, _) = render_output_text(
             "abcdef\n",
             OutputRenderOptions {
                 height: 1,
@@ -2981,7 +3074,7 @@ mod tests {
 
     #[test]
     fn live_progress_is_rendered_before_its_final_newline() {
-        let (text, _) = render_output_text(
+        let (text, _, _) = render_output_text(
             "Starting workload\nTraining:  34%|██████████",
             OutputRenderOptions {
                 height: 2,
@@ -3003,7 +3096,7 @@ mod tests {
     fn output_filter_keeps_matching_lines_and_highlights_matches() {
         let output = "info\nfirst error here\nskip\nsecond error\n";
         let cache = build_output_filter_cache(output, "error");
-        let (text, rendered) = render_output_text(
+        let (text, rendered, _) = render_output_text(
             output,
             OutputRenderOptions {
                 height: 10,
@@ -3135,7 +3228,7 @@ mod tests {
             start: OutputPoint { line: 0, byte: 2 },
             end: OutputPoint { line: 0, byte: 4 },
         };
-        let (text, _) = render_output_text(
+        let (text, _, _) = render_output_text(
             "abcdef\n",
             OutputRenderOptions {
                 height: 1,

@@ -3,8 +3,9 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
+use unicode_segmentation::UnicodeSegmentation;
 
-use crate::app::Job;
+use crate::{app::Job, viewport::display_width};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum JobColumn {
@@ -17,6 +18,16 @@ pub enum JobColumn {
 }
 
 impl JobColumn {
+    fn max_width(self) -> usize {
+        match self {
+            Self::State => 4,
+            Self::Id => usize::MAX,
+            Self::Partition | Self::User => 12,
+            Self::Time => 12,
+            Self::Name => 32,
+        }
+    }
+
     fn span(self, job: &Job) -> Span<'_> {
         match self {
             Self::State => Span::raw(&job.state_compact),
@@ -34,9 +45,10 @@ pub fn job_lines<'a>(jobs: &'a [Job], columns: &[JobColumn]) -> Vec<Line<'a>> {
         .iter()
         .map(|column| {
             jobs.iter()
-                .map(|job| column.span(job).width())
+                .map(|job| display_width(column.span(job).content.trim()))
                 .max()
                 .unwrap_or(0)
+                .min(column.max_width())
         })
         .collect();
     jobs.iter()
@@ -47,12 +59,32 @@ pub fn job_lines<'a>(jobs: &'a [Job], columns: &[JobColumn]) -> Vec<Line<'a>> {
                     spans.push(Span::raw(" "));
                 }
                 let mut span = column.span(job);
-                let padding = widths[index] - span.width();
-                if *column == JobColumn::Time {
-                    span.content = format!("{}{}", " ".repeat(padding), span.content).into();
+                let field = span.content.trim();
+                let width = display_width(field);
+                let cell = if width > widths[index] {
+                    let mut remaining = widths[index] - 1;
+                    let mut end = 0;
+                    for (byte, grapheme) in field.grapheme_indices(true) {
+                        let grapheme_width = display_width(grapheme);
+                        if grapheme_width > remaining {
+                            break;
+                        }
+                        remaining -= grapheme_width;
+                        end = byte + grapheme.len();
+                    }
+                    format!("{}…", &field[..end])
+                } else {
+                    field.to_owned()
+                };
+                let padding = " ".repeat(widths[index] - display_width(&cell));
+                span.content = if *column == JobColumn::Time {
+                    format!("{padding}{cell}")
                 } else if index + 1 < columns.len() {
-                    span.content = format!("{}{}", span.content, " ".repeat(padding)).into();
+                    format!("{cell}{padding}")
+                } else {
+                    cell
                 }
+                .into();
                 spans.push(span);
             }
             let line = Line::from(spans);
