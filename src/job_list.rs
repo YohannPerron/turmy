@@ -21,10 +21,8 @@ impl JobColumn {
     fn max_width(self) -> usize {
         match self {
             Self::State => 4,
-            Self::Id => usize::MAX,
-            Self::Partition | Self::User => 12,
-            Self::Time => 12,
-            Self::Name => 32,
+            Self::Id | Self::Partition | Self::User | Self::Time => 12,
+            Self::Name => usize::MAX,
         }
     }
 
@@ -40,8 +38,12 @@ impl JobColumn {
     }
 }
 
-pub fn job_lines<'a>(jobs: &'a [Job], columns: &[JobColumn]) -> Vec<Line<'a>> {
-    let widths: Vec<usize> = columns
+pub fn job_lines<'a>(
+    jobs: &'a [Job],
+    columns: &[JobColumn],
+    available_width: usize,
+) -> Vec<Line<'a>> {
+    let mut widths: Vec<usize> = columns
         .iter()
         .map(|column| {
             jobs.iter()
@@ -51,18 +53,47 @@ pub fn job_lines<'a>(jobs: &'a [Job], columns: &[JobColumn]) -> Vec<Line<'a>> {
                 .min(column.max_width())
         })
         .collect();
+    let mut fixed_width = widths
+        .iter()
+        .filter(|width| **width > 0)
+        .count()
+        .saturating_sub(1);
+    let mut name_columns = 0;
+    for (column, width) in columns.iter().zip(&widths) {
+        if *column == JobColumn::Name {
+            name_columns += 1;
+        } else {
+            fixed_width += width;
+        }
+    }
+    if let Some(name_width) = available_width
+        .saturating_sub(fixed_width)
+        .checked_div(name_columns)
+    {
+        for (column, width) in columns.iter().zip(&mut widths) {
+            if *column == JobColumn::Name {
+                // Keep a short name visible via horizontal scrolling in narrow panes.
+                *width = (*width).min(name_width.max(6));
+            }
+        }
+    }
+
+    let last_visible = widths.iter().rposition(|width| *width > 0);
     jobs.iter()
         .map(|job| {
             let mut spans = Vec::new();
-            for (index, column) in columns.iter().enumerate() {
-                if index > 0 {
+            for (index, (column, width)) in columns.iter().zip(&widths).enumerate() {
+                let width = *width;
+                if width == 0 {
+                    continue;
+                }
+                if !spans.is_empty() {
                     spans.push(Span::raw(" "));
                 }
                 let mut span = column.span(job);
                 let field = span.content.trim();
-                let width = display_width(field);
-                let cell = if width > widths[index] {
-                    let mut remaining = widths[index] - 1;
+                let cell = if display_width(field) > width {
+                    let mut remaining = width - 1;
                     let mut end = 0;
                     for (byte, grapheme) in field.grapheme_indices(true) {
                         let grapheme_width = display_width(grapheme);
@@ -76,10 +107,10 @@ pub fn job_lines<'a>(jobs: &'a [Job], columns: &[JobColumn]) -> Vec<Line<'a>> {
                 } else {
                     field.to_owned()
                 };
-                let padding = " ".repeat(widths[index] - display_width(&cell));
+                let padding = " ".repeat(width - display_width(&cell));
                 span.content = if *column == JobColumn::Time {
                     format!("{padding}{cell}")
-                } else if index + 1 < columns.len() {
+                } else if Some(index) != last_visible {
                     format!("{cell}{padding}")
                 } else {
                     cell

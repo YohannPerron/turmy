@@ -150,8 +150,10 @@ desktop clipboard accepted it.
 | `--file-refresh` | `TURMY_FILE_REFRESH` | 2 seconds |
 
 List job columns in display order, separated by commas. For example,
-`turmy --jobs-columns id,name,state` shows those three fields. Long fields are
-shortened with an ellipsis. Job IDs stay intact.
+`turmy --jobs-columns id,name,state` shows those three fields. ID, partition, user, and time
+are capped at 12 terminal columns each. The job name uses the space left in the
+Jobs pane. In narrow panes, scroll horizontally to see a short name preview.
+Long values end in an ellipsis. The full job ID is available in Details.
 
 Set the Jobs width as a percentage or a number of content columns. Set the
 Details height in content lines from 0 to 6. A size of zero hides that pane.
