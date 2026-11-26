@@ -1044,7 +1044,11 @@ impl App {
         f.render_widget(help, content_help[1]);
 
         // Jobs
-        let job_lines = job_lines(&self.jobs, &self.job_columns);
+        let job_lines = job_lines(
+            &self.jobs,
+            &self.job_columns,
+            usize::from(jobs_area.width.saturating_sub(2)),
+        );
         let jobs_content_width = job_lines.iter().map(Line::width).max().unwrap_or_default();
         self.jobs_viewport.update(jobs_area, jobs_content_width);
         let jobs_viewport = self.jobs_viewport;
@@ -1118,6 +1122,10 @@ impl App {
                         Span::raw(s),
                     ]);
                 }
+                state_spans.extend([
+                    Span::styled(" ID ", Style::default().fg(Color::Yellow)),
+                    Span::raw(j.id()),
+                ]);
                 let state = Line::from(state_spans);
                 let name = Line::from(vec![
                     Span::styled("Name   ", Style::default().fg(Color::Yellow)),
@@ -2950,7 +2958,7 @@ mod tests {
         job.partition = format!("{}  ", "界".repeat(15));
         job.user = "alice   ".into();
         let jobs = [job];
-        let rows = job_lines(&jobs, &[JobColumn::Partition, JobColumn::User]);
+        let rows = job_lines(&jobs, &[JobColumn::Partition, JobColumn::User], 80);
         assert_eq!(rows[0].to_string(), "界界界界界…  alice");
         assert_eq!(rows[0].spans[0].width(), 12);
     }
@@ -2977,6 +2985,22 @@ mod tests {
     }
 
     #[test]
+    fn jobs_name_uses_the_space_after_capped_fields() {
+        let mut job = test_job("15838238_[129-822%32]");
+        job.name = "界".repeat(25);
+        let jobs = [job];
+        let columns = [JobColumn::Id, JobColumn::Name];
+        let rows = job_lines(&jobs, &columns, 22);
+        assert_eq!(rows[0].to_string(), "15838238_[1… 界界界界…");
+        assert_eq!(rows[0].width(), 22);
+        assert_eq!(
+            job_lines(&jobs, &columns, 12)[0].to_string(),
+            "15838238_[1… 界界…"
+        );
+        assert_eq!(job_lines(&jobs, &columns, 80)[0].width(), 63);
+    }
+
+    #[test]
     fn job_columns_keep_unicode_alignment_and_fused_array_ids() {
         let mut array = test_array_job("42", 1, "PENDING");
         array.array_step = Some("1-3".into());
@@ -2987,7 +3011,7 @@ mod tests {
         finished.finished = true;
 
         let jobs = [array, finished];
-        let rows = job_lines(&jobs, &[JobColumn::Name, JobColumn::Id]);
+        let rows = job_lines(&jobs, &[JobColumn::Name, JobColumn::Id], 80);
         assert_eq!(rows[0].to_string(), "界  42_[1-3]");
         assert_eq!(rows[1].to_string(), "abc 7");
         assert!(rows[1].style.add_modifier.contains(Modifier::DIM));
