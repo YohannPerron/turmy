@@ -2,6 +2,7 @@ use std::{
     fmt,
     fs::File,
     io::{self, Read, Seek},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     thread,
     time::Duration,
@@ -21,6 +22,7 @@ struct FileReader {
     file_path: PathBuf,
     interval: Duration,
     pos: u64,
+    file_identity: Option<(u64, u64)>,
 }
 
 struct FileWatcher {
@@ -158,14 +160,15 @@ impl FileWatcher {
                     let Ok(update) = update else {
                         continue;
                     };
-                    // If the file did not exist when selected but now reads successfully, try to
-                    // enable notifications. Polling continues if this still fails (for example on
-                    // an NFS mount).
-                    if !self.watching
-                        && matches!(update, FileWatcherUpdate::Append(_))
+                    // A replacement can invalidate the watch on the old inode.
+                    let reset = matches!(update, FileWatcherUpdate::Reset);
+                    if (reset || !self.watching && matches!(update, FileWatcherUpdate::Append(_)))
                         && let (Some(watcher), Some(path)) =
                             (watcher.as_mut(), self.file_path.as_ref())
                     {
+                        if reset && self.watching {
+                            let _ = watcher.unwatch(path);
+                        }
                         self.watching = watcher
                             .watch(Path::new(path), RecursiveMode::NonRecursive)
                             .is_ok();
@@ -206,6 +209,7 @@ impl FileReader {
             file_path,
             interval,
             pos: 0,
+            file_identity: None,
         }
     }
 
@@ -227,17 +231,32 @@ impl FileReader {
     }
 
     fn update(&mut self) -> Result<(), SendError<FileWatcherUpdate>> {
-        let update = File::open(&self.file_path)
-            .and_then(|mut file| {
-                self.pos = file.seek(io::SeekFrom::Start(self.pos))?;
-                let mut appended = Vec::new();
-                let bytes_read = file.read_to_end(&mut appended)?;
-                self.pos += bytes_read as u64;
-                Ok(appended)
-            })
-            .map(FileWatcherUpdate::Append)
-            .unwrap_or_else(|error| FileWatcherUpdate::Error(FileWatcherError::File(error)));
+        let update = match self.read_appended() {
+            Ok((reset, bytes)) => {
+                if reset {
+                    self.content_sender.send(FileWatcherUpdate::Reset)?;
+                }
+                FileWatcherUpdate::Append(bytes)
+            }
+            Err(error) => FileWatcherUpdate::Error(FileWatcherError::File(error)),
+        };
         self.content_sender.send(update)
+    }
+
+    fn read_appended(&mut self) -> io::Result<(bool, Vec<u8>)> {
+        let mut file = File::open(&self.file_path)?;
+        let metadata = file.metadata()?;
+        let identity = (metadata.dev(), metadata.ino());
+        let reset = self
+            .file_identity
+            .is_some_and(|previous| previous != identity || metadata.len() < self.pos);
+        let position = if reset { 0 } else { self.pos };
+        file.seek(io::SeekFrom::Start(position))?;
+        let mut appended = Vec::new();
+        let bytes_read = file.read_to_end(&mut appended)?;
+        self.pos = position + bytes_read as u64;
+        self.file_identity = Some(identity);
+        Ok((reset, appended))
     }
 }
 
@@ -424,7 +443,44 @@ fn previous_char_boundary(output: &str, cursor: usize, line_start: usize) -> usi
 
 #[cfg(test)]
 mod tests {
-    use super::LogTextDecoder;
+    use super::*;
+
+    #[test]
+    fn reader_restarts_for_truncated_and_replaced_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stdout");
+        std::fs::write(&path, b"old output").unwrap();
+
+        let (sender, updates) = unbounded();
+        let mut reader =
+            FileReader::new(sender, unbounded().1, path.clone(), Duration::from_secs(2));
+        reader.update().unwrap();
+        assert!(
+            matches!(updates.try_recv().unwrap(), FileWatcherUpdate::Append(bytes) if bytes == b"old output")
+        );
+
+        std::fs::write(&path, b"new").unwrap();
+        reader.update().unwrap();
+        assert!(matches!(
+            updates.try_recv().unwrap(),
+            FileWatcherUpdate::Reset
+        ));
+        assert!(
+            matches!(updates.try_recv().unwrap(), FileWatcherUpdate::Append(bytes) if bytes == b"new")
+        );
+
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, b"replacement output").unwrap();
+        std::fs::rename(replacement, path).unwrap();
+        reader.update().unwrap();
+        assert!(matches!(
+            updates.try_recv().unwrap(),
+            FileWatcherUpdate::Reset
+        ));
+        assert!(
+            matches!(updates.try_recv().unwrap(), FileWatcherUpdate::Append(bytes) if bytes == b"replacement output")
+        );
+    }
 
     #[test]
     fn decoder_preserves_utf8_split_between_appends() {

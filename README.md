@@ -150,12 +150,16 @@ desktop clipboard accepted it.
 | `--file-refresh` | `TURMY_FILE_REFRESH` | 2 seconds |
 
 List job columns in display order, separated by commas. For example,
-`turmy --jobs-columns id,name,state` shows those three fields.
+`turmy --jobs-columns id,name,state` shows those three fields. Long fields are
+shortened with an ellipsis. Job IDs stay intact.
 
 Set the Jobs width as a percentage or a number of content columns. Set the
 Details height in content lines from 0 to 6. A size of zero hides that pane.
 Drag the border between panes to resize them, or double-click it to restore the
 startup size. To reopen a collapsed pane, drag its border inward from the edge.
+Dragging the Jobs border normally reserves a third of the terminal for Details
+and output. If the Jobs pane starts wider, dragging can shrink it from its
+current width. Press `z` to zoom the focused pane.
 
 ## How it works
 
